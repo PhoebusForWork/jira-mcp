@@ -593,12 +593,14 @@ class TestAttachmentsMixin:
         # Mock file operations
         with (
             patch("os.path.exists") as mock_exists,
+            patch("os.path.getsize") as mock_getsize,
             patch("os.path.isabs") as mock_isabs,
             patch("os.path.abspath") as mock_abspath,
             patch("os.path.basename") as mock_basename,
             patch("builtins.open", mock_open(read_data=b"test content")),
         ):
             mock_exists.return_value = True
+            mock_getsize.return_value = 100
             mock_isabs.return_value = True
             mock_abspath.return_value = "/absolute/path/test_file.txt"
             mock_basename.return_value = "test_file.txt"
@@ -619,12 +621,14 @@ class TestAttachmentsMixin:
         # Mock file operations
         with (
             patch("os.path.exists") as mock_exists,
+            patch("os.path.getsize") as mock_getsize,
             patch("os.path.isabs") as mock_isabs,
             patch("os.path.abspath") as mock_abspath,
             patch("os.path.basename") as mock_basename,
             patch("builtins.open", mock_open(read_data=b"test content")),
         ):
             mock_exists.return_value = True
+            mock_getsize.return_value = 100
             mock_isabs.return_value = True
             mock_abspath.return_value = "/absolute/path/test_file.txt"
             mock_basename.return_value = "test_file.txt"
@@ -1316,3 +1320,516 @@ class TestAttachmentsMixin:
         assert result[1].filename == "report.pdf"
         # No download calls should have been made
         attachments_mixin.jira._session.get.assert_not_called()
+
+
+class TestUploadAttachmentData:
+    """Tests for the upload_attachment_data method."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        """Set up test fixtures before each test method."""
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.jira._session = MagicMock()
+        return attachments_mixin
+
+    def test_upload_attachment_data_success(self, attachments_mixin: AttachmentsMixin):
+        """Test uploading in-memory bytes with the requested filename."""
+        attachments_mixin.jira.add_attachment.return_value = [
+            {
+                "id": "10001",
+                "filename": "image.png",
+                "content": "https://test.atlassian.net/secure/attachment/10001/image.png",
+            }
+        ]
+
+        result = attachments_mixin.upload_attachment_data(
+            "TEST-123", "image.png", b"png bytes"
+        )
+
+        assert result["success"] is True
+        assert result["issue_key"] == "TEST-123"
+        assert result["filename"] == "image.png"
+        assert result["size"] == len(b"png bytes")
+        assert result["id"] == "10001"
+        assert result["url"] == (
+            "https://test.atlassian.net/secure/attachment/10001/image.png"
+        )
+        # The temp file passed to the API must end with the requested name
+        call_kwargs = attachments_mixin.jira.add_attachment.call_args.kwargs
+        assert call_kwargs["issue_key"] == "TEST-123"
+        assert call_kwargs["filename"].endswith("image.png")
+
+    def test_upload_attachment_data_strips_directories(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that directory components in the filename are stripped."""
+        attachments_mixin.jira.add_attachment.return_value = {"id": "10001"}
+
+        result = attachments_mixin.upload_attachment_data(
+            "TEST-123", "../../evil/image.png", b"png bytes"
+        )
+
+        assert result["success"] is True
+        assert result["filename"] == "image.png"
+
+    def test_upload_attachment_data_no_issue_key(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with no issue key."""
+        result = attachments_mixin.upload_attachment_data("", "image.png", b"data")
+        assert result["success"] is False
+        assert "issue key" in result["error"].lower()
+
+    def test_upload_attachment_data_no_filename(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with no filename."""
+        result = attachments_mixin.upload_attachment_data("TEST-123", "", b"data")
+        assert result["success"] is False
+        assert "filename" in result["error"].lower()
+
+    def test_upload_attachment_data_empty_content(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload with empty content."""
+        result = attachments_mixin.upload_attachment_data("TEST-123", "image.png", b"")
+        assert result["success"] is False
+        assert "content" in result["error"].lower()
+
+    def test_upload_attachment_data_too_large(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test upload exceeding the 50 MB limit."""
+        from mcp_atlassian.utils.media import ATTACHMENT_MAX_BYTES
+
+        class FakeBytes(bytes):
+            def __len__(self) -> int:
+                return ATTACHMENT_MAX_BYTES + 1
+
+        result = attachments_mixin.upload_attachment_data(
+            "TEST-123", "huge.bin", FakeBytes(b"x")
+        )
+        assert result["success"] is False
+        assert "50 MB" in result["error"]
+        attachments_mixin.jira.add_attachment.assert_not_called()
+
+
+class TestUniqueAttachmentFilename:
+    """Tests for the _resolve_unique_attachment_filename method."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        return attachments_mixin
+
+    def _set_existing(self, mixin: AttachmentsMixin, filenames: list[str]) -> None:
+        existing = []
+        for name in filenames:
+            attachment = MagicMock()
+            attachment.filename = name
+            existing.append(attachment)
+        mixin.get_issue_attachments = MagicMock(return_value=existing)
+
+    def test_no_collision_keeps_filename(self, attachments_mixin: AttachmentsMixin):
+        """Test that a unique filename is returned unchanged."""
+        self._set_existing(attachments_mixin, ["other.png"])
+        result = attachments_mixin._resolve_unique_attachment_filename(
+            "TEST-123", "image.png"
+        )
+        assert result == "image.png"
+
+    def test_collision_adds_timestamp(self, attachments_mixin: AttachmentsMixin):
+        """Test that a colliding filename gets a timestamp suffix."""
+        self._set_existing(attachments_mixin, ["image.png"])
+        result = attachments_mixin._resolve_unique_attachment_filename(
+            "TEST-123", "image.png"
+        )
+        assert result != "image.png"
+        assert result.startswith("image_")
+        assert result.endswith(".png")
+
+    def test_attachment_listing_failure_is_non_fatal(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a listing error falls back to the original filename."""
+        attachments_mixin.get_issue_attachments = MagicMock(
+            side_effect=Exception("boom")
+        )
+        result = attachments_mixin._resolve_unique_attachment_filename(
+            "TEST-123", "image.png"
+        )
+        assert result == "image.png"
+
+
+class TestEmbedImageInDescription:
+    """Tests for the embed_image_in_description method."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[])
+        return attachments_mixin
+
+    def _mock_issue_with_description(
+        self, mixin: AttachmentsMixin, description: str | None
+    ) -> None:
+        mixin.jira.issue.return_value = {"fields": {"description": description}}
+
+    def test_embed_appends_markup(self, attachments_mixin: AttachmentsMixin):
+        """Test appending an image reference to an existing description."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        self._mock_issue_with_description(attachments_mixin, "Existing text")
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="diagram.png"
+        )
+
+        assert result["success"] is True
+        assert result["image_markup"] == "!diagram.png!"
+        update_call = attachments_mixin.jira.update_issue.call_args
+        new_description = update_call.kwargs["update"]["fields"]["description"]
+        assert new_description == "Existing text\n\n!diagram.png!"
+
+    def test_embed_prepends_markup_with_width(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test prepending an image reference with a width."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        self._mock_issue_with_description(attachments_mixin, "Existing text")
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123",
+            image_data=b"png",
+            filename="diagram.png",
+            position="prepend",
+            width=600,
+        )
+
+        assert result["success"] is True
+        assert result["image_markup"] == "!diagram.png|width=600!"
+        update_call = attachments_mixin.jira.update_issue.call_args
+        new_description = update_call.kwargs["update"]["fields"]["description"]
+        assert new_description == "!diagram.png|width=600!\n\nExisting text"
+
+    def test_embed_into_empty_description(self, attachments_mixin: AttachmentsMixin):
+        """Test embedding when the description is empty."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        self._mock_issue_with_description(attachments_mixin, None)
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="diagram.png"
+        )
+
+        assert result["success"] is True
+        update_call = attachments_mixin.jira.update_issue.call_args
+        new_description = update_call.kwargs["update"]["fields"]["description"]
+        assert new_description == "!diagram.png!"
+
+    def test_embed_renames_on_filename_collision(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a colliding filename is timestamped before embedding."""
+        existing = MagicMock()
+        existing.filename = "diagram.png"
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[existing])
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        self._mock_issue_with_description(attachments_mixin, "")
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="diagram.png"
+        )
+
+        assert result["success"] is True
+        embedded_name = result["attachment"]["filename"]
+        assert embedded_name != "diagram.png"
+        assert result["image_markup"] == f"!{embedded_name}!"
+
+    def test_embed_invalid_position(self, attachments_mixin: AttachmentsMixin):
+        """Test that an invalid position is rejected before uploading."""
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="diagram.png", position="middle"
+        )
+        assert result["success"] is False
+        assert "position" in result["error"].lower()
+        attachments_mixin.jira.add_attachment.assert_not_called()
+
+    def test_embed_file_not_found(self, attachments_mixin: AttachmentsMixin):
+        """Test embedding with a missing local file."""
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", file_path="/nonexistent/path/image.png"
+        )
+        assert result["success"] is False
+        assert "File not found" in result["error"]
+
+    def test_embed_update_failure_keeps_attachment_info(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a failed description update still reports the upload."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        self._mock_issue_with_description(attachments_mixin, "Existing text")
+        attachments_mixin.jira.update_issue.side_effect = Exception("update failed")
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="diagram.png"
+        )
+
+        assert result["success"] is False
+        assert "update failed" in result["error"]
+        assert result["attachment"]["success"] is True
+
+
+class TestAddCommentWithImage:
+    """Tests for the add_comment_with_image method."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[])
+        attachments_mixin.preprocessor = MagicMock()
+        attachments_mixin.preprocessor.markdown_to_jira.side_effect = lambda text: (
+            f"wiki:{text}"
+        )
+        return attachments_mixin
+
+    def test_comment_with_image_and_body(self, attachments_mixin: AttachmentsMixin):
+        """Test adding a comment with text and an embedded image."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_add_comment.return_value = {
+            "id": "2001",
+            "created": "2026-01-01T00:00:00.000+0000",
+            "author": {"displayName": "Test User"},
+        }
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123",
+            "See the screenshot",
+            image_data=b"png",
+            filename="shot.png",
+        )
+
+        assert result["success"] is True
+        assert result["comment"]["id"] == "2001"
+        assert result["comment"]["author"] == "Test User"
+        assert result["image_markup"] == "!shot.png!"
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        assert body_arg == "wiki:See the screenshot\n\n!shot.png!"
+
+    def test_comment_image_only(self, attachments_mixin: AttachmentsMixin):
+        """Test adding an image-only comment."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_add_comment.return_value = {
+            "id": "2002",
+            "author": {"displayName": "Test User"},
+        }
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123", "", image_data=b"png", filename="shot.png", width=400
+        )
+
+        assert result["success"] is True
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        assert body_arg == "!shot.png|width=400!"
+
+    def test_comment_upload_failure_short_circuits(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a failed upload prevents posting the comment."""
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123", "text", file_path="/nonexistent/image.png"
+        )
+        assert result["success"] is False
+        attachments_mixin.jira.issue_add_comment.assert_not_called()
+
+    def test_comment_post_failure_keeps_attachment_info(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a failed comment post still reports the upload."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_add_comment.side_effect = Exception(
+            "comment failed"
+        )
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123", "text", image_data=b"png", filename="shot.png"
+        )
+
+        assert result["success"] is False
+        assert "comment failed" in result["error"]
+        assert result["attachment"]["success"] is True
+
+
+class TestEmbedImageMarker:
+    """Tests for marker-positioned image embedding."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[])
+        return attachments_mixin
+
+    def test_marker_replacement_inside_table_cell(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a marker inside a wiki table cell is replaced in place."""
+        description = "||#||截圖||\n|1|[[img:01]]|\n|2|[[img:02]]|"
+        attachments_mixin.jira.issue.return_value = {
+            "fields": {"description": description}
+        }
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123",
+            image_data=b"png",
+            filename="shot.png",
+            position="marker",
+            marker="[[img:01]]",
+            width=300,
+        )
+
+        assert result["success"] is True
+        update_call = attachments_mixin.jira.update_issue.call_args
+        new_description = update_call.kwargs["update"]["fields"]["description"]
+        assert new_description == (
+            "||#||截圖||\n|1|!shot.png|width=300!|\n|2|[[img:02]]|"
+        )
+
+    def test_marker_replaces_only_first_occurrence(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that only the first occurrence of the marker is replaced."""
+        attachments_mixin.jira.issue.return_value = {
+            "fields": {"description": "[[img]] and [[img]]"}
+        }
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123",
+            image_data=b"png",
+            filename="shot.png",
+            position="marker",
+            marker="[[img]]",
+        )
+
+        assert result["success"] is True
+        update_call = attachments_mixin.jira.update_issue.call_args
+        new_description = update_call.kwargs["update"]["fields"]["description"]
+        assert new_description == "!shot.png! and [[img]]"
+
+    def test_marker_not_found_skips_upload(self, attachments_mixin: AttachmentsMixin):
+        """Test that a missing marker fails before uploading anything."""
+        attachments_mixin.jira.issue.return_value = {
+            "fields": {"description": "No placeholder here"}
+        }
+
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123",
+            image_data=b"png",
+            filename="shot.png",
+            position="marker",
+            marker="[[img:01]]",
+        )
+
+        assert result["success"] is False
+        assert "not found" in result["error"]
+        attachments_mixin.jira.add_attachment.assert_not_called()
+        attachments_mixin.jira.update_issue.assert_not_called()
+
+    def test_marker_position_requires_marker(self, attachments_mixin: AttachmentsMixin):
+        """Test that position='marker' without a marker is rejected."""
+        result = attachments_mixin.embed_image_in_description(
+            "TEST-123", image_data=b"png", filename="shot.png", position="marker"
+        )
+        assert result["success"] is False
+        assert "marker" in result["error"]
+        attachments_mixin.jira.add_attachment.assert_not_called()
+
+
+class TestDeleteAttachment:
+    """Tests for the delete_attachment method."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        return attachments_mixin
+
+    def _set_existing(
+        self, mixin: AttachmentsMixin, attachments: list[tuple[str, str]]
+    ) -> None:
+        existing = []
+        for attachment_id, name in attachments:
+            attachment = MagicMock()
+            attachment.id = attachment_id
+            attachment.filename = name
+            existing.append(attachment)
+        mixin.get_issue_attachments = MagicMock(return_value=existing)
+
+    def test_delete_by_id(self, attachments_mixin: AttachmentsMixin):
+        """Test deleting an attachment by its ID."""
+        result = attachments_mixin.delete_attachment(attachment_id="140537")
+
+        assert result["success"] is True
+        assert result["attachment_id"] == "140537"
+        attachments_mixin.jira.remove_attachment.assert_called_once_with("140537")
+
+    def test_delete_by_issue_and_filename(self, attachments_mixin: AttachmentsMixin):
+        """Test deleting an attachment identified by issue key and filename."""
+        self._set_existing(attachments_mixin, [("1", "old.png"), ("2", "other.png")])
+
+        result = attachments_mixin.delete_attachment(
+            issue_key="TEST-123", filename="old.png"
+        )
+
+        assert result["success"] is True
+        assert result["attachment_id"] == "1"
+        assert result["filename"] == "old.png"
+        attachments_mixin.jira.remove_attachment.assert_called_once_with("1")
+
+    def test_delete_filename_not_found(self, attachments_mixin: AttachmentsMixin):
+        """Test deletion failure when the filename does not exist."""
+        self._set_existing(attachments_mixin, [("1", "other.png")])
+
+        result = attachments_mixin.delete_attachment(
+            issue_key="TEST-123", filename="missing.png"
+        )
+
+        assert result["success"] is False
+        assert "No attachment named" in result["error"]
+        attachments_mixin.jira.remove_attachment.assert_not_called()
+
+    def test_delete_ambiguous_filename(self, attachments_mixin: AttachmentsMixin):
+        """Test deletion failure when the filename matches multiple files."""
+        self._set_existing(attachments_mixin, [("1", "dup.png"), ("2", "dup.png")])
+
+        result = attachments_mixin.delete_attachment(
+            issue_key="TEST-123", filename="dup.png"
+        )
+
+        assert result["success"] is False
+        assert "Multiple attachments" in result["error"]
+        assert "1, 2" in result["error"]
+        attachments_mixin.jira.remove_attachment.assert_not_called()
+
+    def test_delete_missing_identifiers(self, attachments_mixin: AttachmentsMixin):
+        """Test that missing identifiers are rejected."""
+        result = attachments_mixin.delete_attachment()
+        assert result["success"] is False
+        assert "attachment_id" in result["error"]
+
+        result = attachments_mixin.delete_attachment(issue_key="TEST-123")
+        assert result["success"] is False
+        attachments_mixin.jira.remove_attachment.assert_not_called()
+
+    def test_delete_api_error(self, attachments_mixin: AttachmentsMixin):
+        """Test deletion failure on API error."""
+        attachments_mixin.jira.remove_attachment.side_effect = Exception("boom")
+
+        result = attachments_mixin.delete_attachment(attachment_id="140537")
+
+        assert result["success"] is False
+        assert "boom" in result["error"]

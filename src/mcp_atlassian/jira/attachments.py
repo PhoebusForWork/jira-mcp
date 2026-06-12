@@ -3,8 +3,12 @@
 import logging
 import mimetypes
 import os
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from requests.exceptions import HTTPError
 
 from ..models.jira import JiraAttachment
 from ..utils.io import validate_safe_path
@@ -379,17 +383,39 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
                 logger.error(f"File not found: {file_path}")
                 return {"success": False, "error": f"File not found: {file_path}"}
 
+            filename = os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+            if file_size > ATTACHMENT_MAX_BYTES:
+                logger.error(
+                    f"Attachment {filename} is {file_size} bytes which exceeds "
+                    "the 50 MB limit"
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"File '{filename}' is {file_size} bytes which exceeds "
+                        "the 50 MB attachment limit."
+                    ),
+                }
+
             logger.info(f"Uploading attachment from {file_path} to issue {issue_key}")
 
             # Use the Jira API to upload the file
-            filename = os.path.basename(file_path)
-            with open(file_path, "rb") as file:
-                attachment = self.jira.add_attachment(
-                    issue_key=issue_key, filename=file_path
-                )
+            attachment = self.jira.add_attachment(
+                issue_key=issue_key, filename=file_path
+            )
 
             if attachment:
-                file_size = os.path.getsize(file_path)
+                # The REST API returns a list of created attachments;
+                # atlassian-python-api may also hand back a single dict.
+                if isinstance(attachment, list) and attachment:
+                    attachment = attachment[0]
+                attachment_id = (
+                    attachment.get("id") if isinstance(attachment, dict) else None
+                )
+                content_url = (
+                    attachment.get("content") if isinstance(attachment, dict) else None
+                )
                 logger.info(
                     f"Successfully uploaded attachment {filename} to {issue_key} (size: {file_size} bytes)"
                 )
@@ -398,9 +424,8 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
                     "issue_key": issue_key,
                     "filename": filename,
                     "size": file_size,
-                    "id": attachment.get("id")
-                    if isinstance(attachment, dict)
-                    else None,
+                    "id": attachment_id,
+                    "url": content_url,
                 }
             else:
                 logger.error(f"Failed to upload attachment {filename} to {issue_key}")
@@ -409,6 +434,10 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
                     "error": f"Failed to upload attachment {filename} to {issue_key}",
                 }
 
+        except HTTPError as e:
+            error_msg = self._attachment_http_error_message(e, issue_key)
+            logger.error(f"Error uploading attachment: {error_msg}")
+            return {"success": False, "error": error_msg}
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Error uploading attachment: {error_msg}")
@@ -466,4 +495,474 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             "total": len(file_paths),
             "uploaded": uploaded,
             "failed": failed,
+        }
+
+    @staticmethod
+    def _attachment_http_error_message(error: HTTPError, issue_key: str) -> str:
+        """Translate an HTTPError from an attachment upload into a clear message."""
+        status = error.response.status_code if error.response is not None else None
+        if status == 403:
+            return (
+                f"Permission denied: you do not have permission to add "
+                f"attachments to {issue_key} (HTTP 403)."
+            )
+        if status == 404:
+            return f"Issue {issue_key} not found or not visible to you (HTTP 404)."
+        if status == 413:
+            return (
+                "Attachment rejected by Jira: file exceeds the instance's "
+                "attachment size limit (HTTP 413)."
+            )
+        return str(error)
+
+    def delete_attachment(
+        self,
+        attachment_id: str | None = None,
+        issue_key: str | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Delete an attachment from a Jira issue.
+
+        The attachment can be identified either directly by its ID, or by
+        the combination of issue key and exact filename. When identifying by
+        filename, the name must match exactly one attachment on the issue;
+        otherwise an error listing the candidate IDs is returned.
+
+        Args:
+            attachment_id: The attachment ID to delete
+            issue_key: The Jira issue key, used with filename
+            filename: The exact attachment filename, used with issue_key
+
+        Returns:
+            A dictionary with the deletion result
+        """
+        if not attachment_id:
+            if not (issue_key and filename):
+                return {
+                    "success": False,
+                    "error": (
+                        "Provide either attachment_id, or both issue_key and filename"
+                    ),
+                }
+            try:
+                matches = [
+                    a
+                    for a in self.get_issue_attachments(issue_key)
+                    if a.filename == filename
+                ]
+            except Exception as e:
+                logger.error(f"Error listing attachments for {issue_key}: {e}")
+                return {
+                    "success": False,
+                    "error": f"Could not list attachments of {issue_key}: {e}",
+                }
+            if not matches:
+                return {
+                    "success": False,
+                    "error": (f"No attachment named '{filename}' found on {issue_key}"),
+                }
+            if len(matches) > 1:
+                ids = ", ".join(str(a.id) for a in matches)
+                return {
+                    "success": False,
+                    "error": (
+                        f"Multiple attachments named '{filename}' found on "
+                        f"{issue_key} (ids: {ids}); use attachment_id to "
+                        "select one"
+                    ),
+                }
+            attachment_id = str(matches[0].id)
+
+        try:
+            self.jira.remove_attachment(attachment_id)
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 403:
+                error_msg = (
+                    f"Permission denied: you do not have permission to "
+                    f"delete attachment {attachment_id} (HTTP 403)."
+                )
+            elif status == 404:
+                error_msg = f"Attachment {attachment_id} not found (HTTP 404)."
+            else:
+                error_msg = str(e)
+            logger.error(f"Error deleting attachment: {error_msg}")
+            return {"success": False, "error": error_msg}
+        except Exception as e:
+            logger.error(f"Error deleting attachment {attachment_id}: {e}")
+            return {"success": False, "error": str(e)}
+
+        result: dict[str, Any] = {
+            "success": True,
+            "attachment_id": attachment_id,
+            "message": f"Attachment {attachment_id} deleted",
+        }
+        if filename:
+            result["filename"] = filename
+        if issue_key:
+            result["issue_key"] = issue_key
+        return result
+
+    def upload_attachment_data(
+        self, issue_key: str, filename: str, data: bytes
+    ) -> dict[str, Any]:
+        """
+        Upload in-memory bytes as an attachment to a Jira issue.
+
+        The bytes are written to a temporary file named ``filename`` so the
+        attachment keeps the requested name in Jira.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            filename: The filename the attachment should have in Jira
+            data: The raw file content
+
+        Returns:
+            A dictionary with upload result information
+        """
+        if not issue_key:
+            logger.error("No issue key provided for attachment upload")
+            return {"success": False, "error": "No issue key provided"}
+
+        if not filename:
+            logger.error("No filename provided for attachment upload")
+            return {"success": False, "error": "No filename provided"}
+
+        if not data:
+            logger.error("No data provided for attachment upload")
+            return {"success": False, "error": "No file content provided"}
+
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            return {
+                "success": False,
+                "error": (
+                    f"File '{filename}' is {len(data)} bytes which exceeds "
+                    "the 50 MB attachment limit."
+                ),
+            }
+
+        # Strip any directory components to avoid path tricks in filenames
+        safe_filename = Path(filename).name
+        if not safe_filename:
+            return {"success": False, "error": f"Invalid filename: {filename}"}
+
+        with tempfile.TemporaryDirectory(prefix="mcp-jira-upload-") as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, safe_filename)
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+            return self.upload_attachment(issue_key, tmp_path)
+
+    def _resolve_unique_attachment_filename(self, issue_key: str, filename: str) -> str:
+        """Return a filename that does not collide with existing attachments.
+
+        Wiki markup image references (``!filename!``) resolve by name, so a
+        duplicate filename would make the reference ambiguous (and typically
+        render the oldest attachment). When a collision is detected, a
+        timestamp is inserted before the extension.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            filename: The desired attachment filename
+
+        Returns:
+            The original filename, or a timestamped variant on collision
+        """
+        try:
+            existing = {a.filename for a in self.get_issue_attachments(issue_key)}
+        except Exception as e:
+            logger.warning(f"Could not check existing attachments for {issue_key}: {e}")
+            existing = set()
+
+        if filename not in existing:
+            return filename
+
+        stem, ext = os.path.splitext(filename)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        candidate = f"{stem}_{timestamp}{ext}"
+        counter = 1
+        while candidate in existing:
+            candidate = f"{stem}_{timestamp}-{counter}{ext}"
+            counter += 1
+        return candidate
+
+    def _upload_image_for_embedding(
+        self,
+        issue_key: str,
+        file_path: str | None = None,
+        image_data: bytes | None = None,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload an image so it can be referenced via wiki markup.
+
+        Accepts either a local file path or raw bytes plus a filename, makes
+        sure the attachment filename is unique on the issue, and uploads it.
+
+        Returns:
+            The upload result dict; on success it contains the final
+            'filename' to reference in wiki markup.
+        """
+        if file_path is not None and image_data is not None:
+            return {
+                "success": False,
+                "error": "Provide either file_path or image data, not both",
+            }
+
+        if file_path is not None:
+            if not os.path.isabs(file_path):
+                file_path = os.path.abspath(file_path)
+            if not os.path.exists(file_path):
+                return {"success": False, "error": f"File not found: {file_path}"}
+            filename = os.path.basename(file_path)
+            try:
+                with open(file_path, "rb") as f:
+                    image_data = f.read()
+            except OSError as e:
+                return {
+                    "success": False,
+                    "error": f"Could not read file {file_path}: {e}",
+                }
+        elif image_data is None:
+            return {
+                "success": False,
+                "error": "Either file_path or image data is required",
+            }
+
+        if not filename:
+            return {"success": False, "error": "No filename provided"}
+
+        unique_filename = self._resolve_unique_attachment_filename(
+            issue_key, Path(filename).name
+        )
+        return self.upload_attachment_data(issue_key, unique_filename, image_data)
+
+    @staticmethod
+    def _image_wiki_markup(filename: str, width: int | None = None) -> str:
+        """Build the wiki markup reference for an attached image."""
+        if width:
+            return f"!{filename}|width={width}!"
+        return f"!{filename}!"
+
+    def embed_image_in_description(
+        self,
+        issue_key: str,
+        file_path: str | None = None,
+        image_data: bytes | None = None,
+        filename: str | None = None,
+        position: str = "append",
+        width: int | None = None,
+        marker: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Upload an image and embed it in the issue description body.
+
+        The image is attached to the issue, then referenced from the
+        description using wiki markup (``!filename!``). The description is
+        read and written through REST API v2, which uses wiki markup text on
+        both Cloud and Server/DC, so the image renders inline in the
+        description on the Jira web UI.
+
+        With ``position='marker'``, the first occurrence of ``marker`` in
+        the description is replaced by the image reference. This allows
+        placing images anywhere — including inside table cells — by writing
+        placeholder tokens (e.g. ``[[img:01]]``) into the description first.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            file_path: Local path of the image file to upload
+            image_data: Raw image bytes (alternative to file_path)
+            filename: Filename for the attachment (required with image_data)
+            position: Where to insert the image: 'append', 'prepend' or
+                'marker'
+            width: Optional rendered width in pixels
+            marker: Placeholder text to replace (required with
+                ``position='marker'``)
+
+        Returns:
+            A dictionary with the upload result, the wiki markup used and
+            the update status
+        """
+        if position not in ("append", "prepend", "marker"):
+            return {
+                "success": False,
+                "error": (
+                    f"Invalid position '{position}': use 'append', 'prepend' "
+                    "or 'marker'"
+                ),
+            }
+        if position == "marker" and not marker:
+            return {
+                "success": False,
+                "error": "position='marker' requires a non-empty 'marker' value",
+            }
+
+        try:
+            # Read the current description via API v2 (wiki markup text)
+            # before uploading, so a missing marker fails without leaving an
+            # orphaned attachment behind.
+            issue_data = self.jira.issue(issue_key, fields="description")
+            description = ""
+            if isinstance(issue_data, dict):
+                description = issue_data.get("fields", {}).get("description") or ""
+            if not isinstance(description, str):
+                # Defensive: v2 should always return wiki markup text
+                logger.warning(
+                    f"Description of {issue_key} is not plain text; "
+                    "appending image reference to an empty body"
+                )
+                description = ""
+        except HTTPError as e:
+            error_msg = self._attachment_http_error_message(e, issue_key)
+            logger.error(f"Error reading description of {issue_key}: {error_msg}")
+            return {"success": False, "error": error_msg}
+        except Exception as e:
+            logger.error(f"Error reading description of {issue_key}: {e}")
+            return {"success": False, "error": str(e)}
+
+        if position == "marker" and marker not in description:
+            return {
+                "success": False,
+                "error": (
+                    f"Marker '{marker}' not found in the description of "
+                    f"{issue_key}; nothing was uploaded"
+                ),
+            }
+
+        upload_result = self._upload_image_for_embedding(
+            issue_key, file_path=file_path, image_data=image_data, filename=filename
+        )
+        if not upload_result.get("success"):
+            return upload_result
+
+        attached_filename = upload_result["filename"]
+        markup = self._image_wiki_markup(attached_filename, width)
+
+        try:
+            if position == "marker":
+                assert marker is not None  # noqa: S101 - validated above
+                new_description = description.replace(marker, markup, 1)
+            elif not description:
+                new_description = markup
+            elif position == "prepend":
+                new_description = f"{markup}\n\n{description}"
+            else:
+                new_description = f"{description}\n\n{markup}"
+
+            # Update via API v2 so wiki markup is preserved
+            self.jira.update_issue(
+                issue_key=issue_key,
+                update={"fields": {"description": new_description}},
+            )
+        except HTTPError as e:
+            error_msg = self._attachment_http_error_message(e, issue_key)
+            logger.error(f"Error embedding image in description: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Image uploaded but description update failed: {error_msg}",
+                "attachment": upload_result,
+            }
+        except Exception as e:
+            logger.error(f"Error embedding image in description: {e}")
+            return {
+                "success": False,
+                "error": f"Image uploaded but description update failed: {e}",
+                "attachment": upload_result,
+            }
+
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "attachment": upload_result,
+            "image_markup": markup,
+            "position": position,
+            "message": (
+                f"Image '{attached_filename}' uploaded and embedded in the "
+                f"description of {issue_key}"
+            ),
+        }
+
+    def add_comment_with_image(
+        self,
+        issue_key: str,
+        body: str,
+        file_path: str | None = None,
+        image_data: bytes | None = None,
+        filename: str | None = None,
+        width: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Upload an image and add a comment that displays it inline.
+
+        The image is attached to the issue, then a comment is posted through
+        REST API v2 with the body in wiki markup (Markdown input is converted)
+        followed by an image reference (``!filename!``), so the image renders
+        inside the comment on the Jira web UI.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            body: Comment text (Markdown), may be empty for an image-only comment
+            file_path: Local path of the image file to upload
+            image_data: Raw image bytes (alternative to file_path)
+            filename: Filename for the attachment (required with image_data)
+            width: Optional rendered width in pixels
+
+        Returns:
+            A dictionary with the upload result, the wiki markup used and
+            the created comment details
+        """
+        upload_result = self._upload_image_for_embedding(
+            issue_key, file_path=file_path, image_data=image_data, filename=filename
+        )
+        if not upload_result.get("success"):
+            return upload_result
+
+        attached_filename = upload_result["filename"]
+        markup = self._image_wiki_markup(attached_filename, width)
+
+        try:
+            wiki_body = ""
+            if body:
+                # Convert Markdown to wiki markup (not ADF): the comment is
+                # posted via API v2 so the image reference stays intact
+                wiki_body = self.preprocessor.markdown_to_jira(body)
+            full_body = f"{wiki_body}\n\n{markup}" if wiki_body else markup
+
+            result = self.jira.issue_add_comment(issue_key, full_body)
+            if not isinstance(result, dict):
+                msg = (
+                    "Unexpected return value type from "
+                    f"`jira.issue_add_comment`: {type(result)}"
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+        except HTTPError as e:
+            error_msg = self._attachment_http_error_message(e, issue_key)
+            logger.error(f"Error adding comment with image: {error_msg}")
+            return {
+                "success": False,
+                "error": f"Image uploaded but adding the comment failed: {error_msg}",
+                "attachment": upload_result,
+            }
+        except Exception as e:
+            logger.error(f"Error adding comment with image: {e}")
+            return {
+                "success": False,
+                "error": f"Image uploaded but adding the comment failed: {e}",
+                "attachment": upload_result,
+            }
+
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "attachment": upload_result,
+            "image_markup": markup,
+            "comment": {
+                "id": result.get("id"),
+                "created": result.get("created"),
+                "author": result.get("author", {}).get("displayName", "Unknown"),
+            },
+            "message": (
+                f"Image '{attached_filename}' uploaded and embedded in a new "
+                f"comment on {issue_key}"
+            ),
         }

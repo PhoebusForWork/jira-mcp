@@ -381,6 +381,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     )
     from src.mcp_atlassian.servers.jira import (
         add_comment,
+        add_comment_with_image,
         add_issues_to_sprint,
         add_worklog,
         batch_create_issues,
@@ -389,9 +390,11 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         create_issue,
         create_issue_link,
         create_sprint,
+        delete_attachment,
         delete_issue,
         download_attachments,
         edit_comment,
+        embed_image_in_description,
         get_agile_boards,
         get_all_projects,
         get_board_issues,
@@ -417,6 +420,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         transition_issue,
         update_issue,
         update_sprint,
+        upload_attachment,
     )
 
     jira_sub_mcp = FastMCP(name="TestJiraSubMCP")
@@ -457,6 +461,10 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(update_sprint)
     jira_sub_mcp.add_tool(add_issues_to_sprint)
     jira_sub_mcp.add_tool(batch_create_versions)
+    jira_sub_mcp.add_tool(upload_attachment)
+    jira_sub_mcp.add_tool(delete_attachment)
+    jira_sub_mcp.add_tool(embed_image_in_description)
+    jira_sub_mcp.add_tool(add_comment_with_image)
     test_mcp.mount(jira_sub_mcp, prefix="jira")
     return test_mcp
 
@@ -1042,8 +1050,8 @@ async def test_get_all_projects_tool(jira_client, mock_jira_fetcher):
     ]
     # Reset the mock and set specific return value for this test
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        mock_projects
     )
 
     # Test with default parameters (include_archived=False)
@@ -1091,8 +1099,8 @@ async def test_get_all_projects_tool_with_archived(jira_client, mock_jira_fetche
     ]
     # Reset the mock and set specific return value for this test
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        mock_projects
     )
 
     # Test with include_archived=True
@@ -1145,8 +1153,8 @@ async def test_get_all_projects_tool_with_projects_filter(
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Set up the projects filter in the config
@@ -1199,8 +1207,8 @@ async def test_get_all_projects_tool_no_projects_filter(jira_client, mock_jira_f
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Ensure no projects filter is set
@@ -1260,8 +1268,8 @@ async def test_get_all_projects_tool_case_insensitive_filter(
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Set up projects filter with mixed case and whitespace
@@ -2430,3 +2438,312 @@ async def test_get_field_options_combined(jira_client, mock_jira_fetcher):
     # return_limit=1 caps to first match
     assert len(result) == 1
     assert result[0] == "High"
+
+
+# ── jira_upload_attachment / image embedding tests ───────────────────
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_with_file_path(jira_client, mock_jira_fetcher):
+    """Test uploading an attachment from a local file path."""
+    mock_jira_fetcher.upload_attachment.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "filename": "report.pdf",
+        "size": 2048,
+        "id": "10001",
+        "url": "https://test.atlassian.net/secure/attachment/10001/report.pdf",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_upload_attachment",
+        {"issue_key": "TEST-123", "file_path": "/tmp/report.pdf"},
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    assert content["id"] == "10001"
+    assert content["filename"] == "report.pdf"
+    mock_jira_fetcher.upload_attachment.assert_called_once_with(
+        issue_key="TEST-123", file_path="/tmp/report.pdf"
+    )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_with_base64(jira_client, mock_jira_fetcher):
+    """Test uploading an attachment from base64 content."""
+    import base64 as b64
+
+    mock_jira_fetcher.upload_attachment_data.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "filename": "image.png",
+        "size": 9,
+        "id": "10002",
+        "url": "https://test.atlassian.net/secure/attachment/10002/image.png",
+    }
+
+    encoded = b64.b64encode(b"png bytes").decode("ascii")
+    response = await jira_client.call_tool(
+        "jira_upload_attachment",
+        {"issue_key": "TEST-123", "file_base64": encoded, "filename": "image.png"},
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    assert content["id"] == "10002"
+    mock_jira_fetcher.upload_attachment_data.assert_called_once_with(
+        issue_key="TEST-123", filename="image.png", data=b"png bytes"
+    )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_requires_exactly_one_source(jira_client):
+    """Test that file_path and file_base64 are mutually exclusive."""
+    with pytest.raises(ToolError, match="exactly one"):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {
+                "issue_key": "TEST-123",
+                "file_path": "/tmp/a.png",
+                "file_base64": "aGk=",
+                "filename": "a.png",
+            },
+        )
+
+    with pytest.raises(ToolError, match="exactly one"):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {"issue_key": "TEST-123"},
+        )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_base64_requires_filename(jira_client):
+    """Test that base64 uploads require a filename."""
+    with pytest.raises(ToolError, match="filename"):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {"issue_key": "TEST-123", "file_base64": "aGk="},
+        )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_invalid_base64(jira_client):
+    """Test that invalid base64 input is rejected."""
+    with pytest.raises(ToolError, match="base64"):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {
+                "issue_key": "TEST-123",
+                "file_base64": "!!!not-base64!!!",
+                "filename": "a.png",
+            },
+        )
+
+
+@pytest.mark.anyio
+async def test_upload_attachment_failure_raises(jira_client, mock_jira_fetcher):
+    """Test that a failed upload surfaces as a tool error."""
+    mock_jira_fetcher.upload_attachment.return_value = {
+        "success": False,
+        "error": "File not found: /tmp/missing.png",
+    }
+
+    with pytest.raises(ToolError, match="File not found"):
+        await jira_client.call_tool(
+            "jira_upload_attachment",
+            {"issue_key": "TEST-123", "file_path": "/tmp/missing.png"},
+        )
+
+
+@pytest.mark.anyio
+async def test_embed_image_in_description_tool(jira_client, mock_jira_fetcher):
+    """Test embedding an image in the issue description."""
+    mock_jira_fetcher.embed_image_in_description.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": {"id": "10003", "filename": "diagram.png"},
+        "image_markup": "!diagram.png|width=600!",
+        "position": "append",
+        "message": "Image embedded",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_embed_image_in_description",
+        {
+            "issue_key": "TEST-123",
+            "file_path": "/tmp/diagram.png",
+            "width": 600,
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    assert content["image_markup"] == "!diagram.png|width=600!"
+    mock_jira_fetcher.embed_image_in_description.assert_called_once_with(
+        issue_key="TEST-123",
+        file_path="/tmp/diagram.png",
+        image_data=None,
+        filename=None,
+        position="append",
+        width=600,
+        marker=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_embed_image_in_description_failure_raises(
+    jira_client, mock_jira_fetcher
+):
+    """Test that an embed failure surfaces as a tool error."""
+    mock_jira_fetcher.embed_image_in_description.return_value = {
+        "success": False,
+        "error": "Permission denied",
+    }
+
+    with pytest.raises(ToolError, match="Permission denied"):
+        await jira_client.call_tool(
+            "jira_embed_image_in_description",
+            {"issue_key": "TEST-123", "file_path": "/tmp/diagram.png"},
+        )
+
+
+@pytest.mark.anyio
+async def test_add_comment_with_image_tool(jira_client, mock_jira_fetcher):
+    """Test adding a comment with an embedded image."""
+    import base64 as b64
+
+    mock_jira_fetcher.add_comment_with_image.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": {"id": "10004", "filename": "shot.png"},
+        "image_markup": "!shot.png!",
+        "comment": {"id": "2001", "author": "Test User"},
+        "message": "Comment added",
+    }
+
+    encoded = b64.b64encode(b"png bytes").decode("ascii")
+    response = await jira_client.call_tool(
+        "jira_add_comment_with_image",
+        {
+            "issue_key": "TEST-123",
+            "body": "See screenshot",
+            "file_base64": encoded,
+            "filename": "shot.png",
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    assert content["comment"]["id"] == "2001"
+    mock_jira_fetcher.add_comment_with_image.assert_called_once_with(
+        issue_key="TEST-123",
+        body="See screenshot",
+        file_path=None,
+        image_data=b"png bytes",
+        filename="shot.png",
+        width=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_embed_image_in_description_marker_mode(jira_client, mock_jira_fetcher):
+    """Test that the marker parameter is forwarded to the fetcher."""
+    mock_jira_fetcher.embed_image_in_description.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": {"id": "10005", "filename": "cell.png"},
+        "image_markup": "!cell.png!",
+        "position": "marker",
+        "message": "Image embedded",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_embed_image_in_description",
+        {
+            "issue_key": "TEST-123",
+            "file_path": "/tmp/cell.png",
+            "position": "marker",
+            "marker": "[[img:01]]",
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    mock_jira_fetcher.embed_image_in_description.assert_called_once_with(
+        issue_key="TEST-123",
+        file_path="/tmp/cell.png",
+        image_data=None,
+        filename=None,
+        position="marker",
+        width=None,
+        marker="[[img:01]]",
+    )
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_by_id(jira_client, mock_jira_fetcher):
+    """Test deleting an attachment by ID."""
+    mock_jira_fetcher.delete_attachment.return_value = {
+        "success": True,
+        "attachment_id": "140537",
+        "message": "Attachment 140537 deleted",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_delete_attachment",
+        {"attachment_id": "140537"},
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    mock_jira_fetcher.delete_attachment.assert_called_once_with(
+        attachment_id="140537", issue_key=None, filename=None
+    )
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_by_filename(jira_client, mock_jira_fetcher):
+    """Test deleting an attachment by issue key and filename."""
+    mock_jira_fetcher.delete_attachment.return_value = {
+        "success": True,
+        "attachment_id": "1",
+        "filename": "old.png",
+        "issue_key": "TEST-123",
+        "message": "Attachment 1 deleted",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_delete_attachment",
+        {"issue_key": "TEST-123", "filename": "old.png"},
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    assert content["filename"] == "old.png"
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_requires_identifier(jira_client):
+    """Test that an identifier is required."""
+    with pytest.raises(ToolError, match="attachment_id"):
+        await jira_client.call_tool(
+            "jira_delete_attachment",
+            {"issue_key": "TEST-123"},
+        )
+
+
+@pytest.mark.anyio
+async def test_delete_attachment_failure_raises(jira_client, mock_jira_fetcher):
+    """Test that a failed deletion surfaces as a tool error."""
+    mock_jira_fetcher.delete_attachment.return_value = {
+        "success": False,
+        "error": "Attachment 999 not found (HTTP 404).",
+    }
+
+    with pytest.raises(ToolError, match="not found"):
+        await jira_client.call_tool(
+            "jira_delete_attachment",
+            {"attachment_id": "999"},
+        )

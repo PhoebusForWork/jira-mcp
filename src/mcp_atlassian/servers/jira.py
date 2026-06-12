@@ -1037,6 +1037,454 @@ async def get_issue_images(
     return contents
 
 
+def _resolve_attachment_source(
+    file_path: str | None,
+    file_base64: str | None,
+    filename: str | None,
+) -> tuple[str | None, bytes | None, str | None]:
+    """Validate and normalize the file input of attachment upload tools.
+
+    Exactly one of file_path or file_base64 must be provided; file_base64
+    additionally requires filename.
+
+    Returns:
+        Tuple of (file_path, decoded bytes, filename); only one of
+        file_path / bytes is non-None.
+
+    Raises:
+        ValueError: If the combination of inputs is invalid or the base64
+            payload cannot be decoded or exceeds the size limit.
+    """
+    if (file_path is None) == (file_base64 is None):
+        raise ValueError(
+            "Provide exactly one of 'file_path' or 'file_base64' (with 'filename')."
+        )
+
+    if file_base64 is not None:
+        if not filename:
+            raise ValueError("'filename' is required when using 'file_base64'.")
+        try:
+            data = base64.b64decode(file_base64, validate=True)
+        except Exception as e:
+            raise ValueError(f"'file_base64' is not valid base64 data: {e}") from e
+        if not data:
+            raise ValueError("'file_base64' decoded to empty content.")
+        if len(data) > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"Decoded file is {len(data)} bytes which exceeds the "
+                "50 MB attachment limit."
+            )
+        return None, data, filename
+
+    return file_path, None, None
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_attachments"},
+    annotations={"title": "Upload Attachment", "destructiveHint": True},
+)
+@check_write_access
+async def upload_attachment(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    file_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Absolute path of a local file to upload "
+                "(e.g., '/path/to/screenshot.png'). "
+                "Mutually exclusive with file_base64."
+            ),
+            default=None,
+        ),
+    ] = None,
+    file_base64: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Base64-encoded file content to upload. Requires 'filename'. "
+                "Mutually exclusive with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Filename for the attachment in Jira (e.g., 'screenshot.png'). "
+                "Required when using file_base64; ignored with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """Upload a file as an attachment to a Jira issue.
+
+    Use this to attach a local file (by path) or in-memory content (as
+    base64) to an issue. The file appears in the issue's attachment section;
+    to also display an image inline in the description or a comment, use
+    'jira_embed_image_in_description' or 'jira_add_comment_with_image'.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        file_path: Local file path to upload (one of file_path/file_base64).
+        file_base64: Base64-encoded file content (one of file_path/file_base64).
+        filename: Attachment filename, required with file_base64.
+
+    Returns:
+        JSON string with the upload result: attachment id, filename, size
+        and content URL.
+
+    Raises:
+        ValueError: If in read-only mode, input is invalid, the file is
+            missing or too large, or the upload fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+    path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+
+    if path is not None:
+        result = jira.upload_attachment(issue_key=issue_key, file_path=path)
+    else:
+        result = jira.upload_attachment_data(
+            issue_key=issue_key, filename=name, data=data
+        )
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to upload attachment to {issue_key}: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_attachments"},
+    annotations={"title": "Delete Attachment", "destructiveHint": True},
+)
+@check_write_access
+async def delete_attachment(
+    ctx: Context,
+    attachment_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "ID of the attachment to delete (e.g., '140537'). "
+                "Mutually exclusive with issue_key+filename."
+            ),
+            default=None,
+        ),
+    ] = None,
+    issue_key: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Jira issue key (e.g., 'PROJ-123'), used together with "
+                "'filename' when attachment_id is not known."
+            ),
+            pattern=ISSUE_KEY_PATTERN,
+            default=None,
+        ),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Exact attachment filename to delete (e.g., 'old_image.png'). "
+                "Must match exactly one attachment on the issue."
+            ),
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """Delete an attachment from a Jira issue.
+
+    Identify the attachment either by attachment_id (precise, preferred),
+    or by issue_key + exact filename. If the filename matches more than one
+    attachment, the call fails and lists the candidate IDs so a specific
+    one can be chosen. Useful for cleaning up superseded files, e.g. old
+    images replaced by 'jira_embed_image_in_description'.
+
+    Args:
+        ctx: The FastMCP context.
+        attachment_id: ID of the attachment to delete.
+        issue_key: Jira issue key, used with filename.
+        filename: Exact attachment filename, used with issue_key.
+
+    Returns:
+        JSON string with the deletion result.
+
+    Raises:
+        ValueError: If in read-only mode, input is invalid, the attachment
+            cannot be identified unambiguously, or the deletion fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+
+    if attachment_id is None and not (issue_key and filename):
+        raise ValueError(
+            "Provide either 'attachment_id', or both 'issue_key' and 'filename'."
+        )
+
+    result = jira.delete_attachment(
+        attachment_id=attachment_id, issue_key=issue_key, filename=filename
+    )
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to delete attachment: {result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_attachments"},
+    annotations={"title": "Embed Image in Description", "destructiveHint": True},
+)
+@check_write_access
+async def embed_image_in_description(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    file_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Absolute path of a local image file "
+                "(e.g., '/path/to/diagram.png'). "
+                "Mutually exclusive with file_base64."
+            ),
+            default=None,
+        ),
+    ] = None,
+    file_base64: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Base64-encoded image content. Requires 'filename'. "
+                "Mutually exclusive with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Filename for the attachment in Jira (e.g., 'diagram.png'). "
+                "Required when using file_base64; ignored with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    position: Annotated[
+        str,
+        Field(
+            description=(
+                "Where to insert the image in the description: "
+                "'append' (default), 'prepend', or 'marker' to replace a "
+                "placeholder token anywhere in the description (including "
+                "inside table cells). 'marker' requires the 'marker' "
+                "parameter."
+            ),
+            default="append",
+        ),
+    ] = "append",
+    width: Annotated[
+        int | None,
+        Field(
+            description="(Optional) Rendered image width in pixels (e.g., 600).",
+            default=None,
+            gt=0,
+        ),
+    ] = None,
+    marker: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Placeholder text to replace with the image when "
+                "position='marker' (e.g., '[[img:01]]'). Write the "
+                "placeholder into the description first (it can sit inside "
+                "a table cell), then call this tool with the same marker. "
+                "Only the first occurrence is replaced."
+            ),
+            default=None,
+        ),
+    ] = None,
+) -> str:
+    """Upload an image and display it inline in the issue description.
+
+    The image is attached to the issue and then referenced from the
+    description body with wiki markup ('!filename!'), so it renders inline
+    on the Jira web UI instead of only appearing in the attachment section.
+    If an attachment with the same filename already exists, the new file is
+    renamed with a timestamp so the reference points at the new image.
+
+    To position an image precisely (e.g., inside a table cell or next to a
+    specific section), first create or update the description with a unique
+    placeholder token such as '[[img:01]]' at the desired spot, then call
+    this tool with position='marker' and marker='[[img:01]]'.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        file_path: Local image path (one of file_path/file_base64).
+        file_base64: Base64-encoded image content (one of file_path/file_base64).
+        filename: Attachment filename, required with file_base64.
+        position: 'append' (default), 'prepend', or 'marker'.
+        width: Optional rendered width in pixels.
+        marker: Placeholder text to replace when position='marker'.
+
+    Returns:
+        JSON string with the upload result, the wiki markup inserted and a
+        confirmation message.
+
+    Raises:
+        ValueError: If in read-only mode, input is invalid, the marker is
+            missing from the description, or the upload or description
+            update fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+    path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+
+    result = jira.embed_image_in_description(
+        issue_key=issue_key,
+        file_path=path,
+        image_data=data,
+        filename=name,
+        position=position,
+        width=width,
+        marker=marker,
+    )
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to embed image in description of {issue_key}: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_comments"},
+    annotations={"title": "Add Comment with Image", "destructiveHint": True},
+)
+@check_write_access
+async def add_comment_with_image(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    body: Annotated[
+        str,
+        Field(
+            description=(
+                "Comment text in Markdown format. May be empty for an "
+                "image-only comment."
+            ),
+            default="",
+        ),
+    ] = "",
+    file_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Absolute path of a local image file "
+                "(e.g., '/path/to/screenshot.png'). "
+                "Mutually exclusive with file_base64."
+            ),
+            default=None,
+        ),
+    ] = None,
+    file_base64: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Base64-encoded image content. Requires 'filename'. "
+                "Mutually exclusive with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Filename for the attachment in Jira (e.g., 'screenshot.png'). "
+                "Required when using file_base64; ignored with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    width: Annotated[
+        int | None,
+        Field(
+            description="(Optional) Rendered image width in pixels (e.g., 600).",
+            default=None,
+            gt=0,
+        ),
+    ] = None,
+) -> str:
+    """Add a comment to a Jira issue with an image displayed inline.
+
+    The image is attached to the issue and the comment references it with
+    wiki markup ('!filename!'), so it renders inside the comment on the Jira
+    web UI. Use this instead of 'jira_add_comment' when the comment should
+    show an image. If an attachment with the same filename already exists,
+    the new file is renamed with a timestamp.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        body: Comment text in Markdown (may be empty for image-only).
+        file_path: Local image path (one of file_path/file_base64).
+        file_base64: Base64-encoded image content (one of file_path/file_base64).
+        filename: Attachment filename, required with file_base64.
+        width: Optional rendered width in pixels.
+
+    Returns:
+        JSON string with the upload result, the wiki markup used and the
+        created comment details.
+
+    Raises:
+        ValueError: If in read-only mode, input is invalid, or the upload or
+            comment creation fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+    path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+
+    result = jira.add_comment_with_image(
+        issue_key=issue_key,
+        body=body,
+        file_path=path,
+        image_data=data,
+        filename=name,
+        width=width,
+    )
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to add comment with image to {issue_key}: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
 @jira_mcp.tool(
     tags={"jira", "read", "toolset:jira_agile"},
     annotations={"title": "Get Agile Boards", "readOnlyHint": True},
