@@ -1394,8 +1394,12 @@ async def add_comment_with_image(
         str,
         Field(
             description=(
-                "Comment text in Markdown format. May be empty for an "
-                "image-only comment."
+                "Comment text in Markdown format. May be empty when "
+                "uploading an image. To display attachments that already "
+                "exist on the issue, reference them with wiki syntax on "
+                "their own line, e.g. '!photo_1.png|width=600!' — these "
+                "references are preserved verbatim (underscores and "
+                "non-ASCII filenames are safe)."
             ),
             default="",
         ),
@@ -1404,9 +1408,10 @@ async def add_comment_with_image(
         str | None,
         Field(
             description=(
-                "Absolute path of a local image file "
-                "(e.g., '/path/to/screenshot.png'). "
-                "Mutually exclusive with file_base64."
+                "(Optional) Absolute path of a local image file to upload "
+                "and append to the comment (e.g., '/path/to/screenshot.png'). "
+                "Mutually exclusive with file_base64. Omit both to only "
+                "reference attachments that already exist on the issue."
             ),
             default=None,
         ),
@@ -1415,8 +1420,8 @@ async def add_comment_with_image(
         str | None,
         Field(
             description=(
-                "Base64-encoded image content. Requires 'filename'. "
-                "Mutually exclusive with file_path."
+                "(Optional) Base64-encoded image content to upload. Requires "
+                "'filename'. Mutually exclusive with file_path."
             ),
             default=None,
         ),
@@ -1434,39 +1439,60 @@ async def add_comment_with_image(
     width: Annotated[
         int | None,
         Field(
-            description="(Optional) Rendered image width in pixels (e.g., 600).",
+            description=(
+                "(Optional) Rendered width in pixels for the uploaded image "
+                "(e.g., 600)."
+            ),
             default=None,
             gt=0,
         ),
     ] = None,
 ) -> str:
-    """Add a comment to a Jira issue with an image displayed inline.
+    """Add a comment to a Jira issue with images displayed inline.
 
-    The image is attached to the issue and the comment references it with
-    wiki markup ('!filename!'), so it renders inside the comment on the Jira
-    web UI. Use this instead of 'jira_add_comment' when the comment should
-    show an image. If an attachment with the same filename already exists,
-    the new file is renamed with a timestamp.
+    The comment is posted with wiki markup image references, which render
+    inside the comment on the Jira web UI (Jira Cloud converts them to
+    internal ADF media nodes server-side). Use this instead of
+    'jira_add_comment' whenever the comment should show an image — plain
+    add/edit comment tools cannot render images.
+
+    Images can come from two sources, combinable in one call:
+    - Upload a new file via file_path or file_base64 (its reference is
+      appended to the comment; same-name attachments are renamed with a
+      timestamp).
+    - Reference attachments already on the issue directly in the body with
+      wiki syntax ('!photo_1.png|width=600!' on its own line). No upload
+      or placeholder image is needed for this mode.
 
     Args:
         ctx: The FastMCP context.
         issue_key: Jira issue key.
-        body: Comment text in Markdown (may be empty for image-only).
-        file_path: Local image path (one of file_path/file_base64).
-        file_base64: Base64-encoded image content (one of file_path/file_base64).
+        body: Comment text in Markdown; may reference existing attachments
+            with wiki image syntax. May be empty when uploading an image.
+        file_path: (Optional) Local image path to upload.
+        file_base64: (Optional) Base64-encoded image content to upload.
         filename: Attachment filename, required with file_base64.
-        width: Optional rendered width in pixels.
+        width: Optional rendered width in pixels for the uploaded image.
 
     Returns:
-        JSON string with the upload result, the wiki markup used and the
-        created comment details.
+        JSON string with the upload result (if any), the wiki markup used
+        and the created comment details.
 
     Raises:
         ValueError: If in read-only mode, input is invalid, or the upload or
             comment creation fails.
     """
     jira = await get_jira_fetcher(ctx)
-    path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+
+    path: str | None = None
+    data: bytes | None = None
+    name: str | None = None
+    if file_path is not None or file_base64 is not None:
+        path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+    elif not body:
+        raise ValueError(
+            "Provide 'body', an image (file_path or file_base64), or both."
+        )
 
     result = jira.add_comment_with_image(
         issue_key=issue_key,
@@ -1480,6 +1506,50 @@ async def add_comment_with_image(
     if not result.get("success"):
         raise ValueError(
             f"Failed to add comment with image to {issue_key}: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_comments"},
+    annotations={"title": "Delete Comment", "destructiveHint": True},
+)
+@check_write_access
+async def delete_comment(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    comment_id: Annotated[str, Field(description="The ID of the comment to delete")],
+) -> str:
+    """Delete a comment from a Jira issue.
+
+    Useful for cleaning up mistaken or superseded comments, e.g. an image
+    comment that failed verification and was reposted.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        comment_id: The ID of the comment to delete.
+
+    Returns:
+        JSON string with the deletion result.
+
+    Raises:
+        ValueError: If in read-only mode, the comment does not exist, or
+            the deletion fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+    result = jira.delete_comment(issue_key=issue_key, comment_id=comment_id)
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to delete comment {comment_id} on {issue_key}: "
             f"{result.get('error', 'unknown error')}"
         )
     return json.dumps(result, indent=2, ensure_ascii=False)

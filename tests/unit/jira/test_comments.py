@@ -551,3 +551,43 @@ class TestCommentsMixin:
         # ServiceDesk post should NOT be called
         comments_mixin.jira.post.assert_not_called()
         assert result["id"] == "10001"
+
+
+class TestDeleteComment:
+    """Tests for the delete_comment method."""
+
+    @pytest.fixture
+    def comments_mixin(self, jira_client):
+        """Create a CommentsMixin instance with mocked dependencies."""
+        mixin = CommentsMixin(config=jira_client.config)
+        mixin.jira = jira_client.jira
+        return mixin
+
+    def test_delete_comment_success(self, comments_mixin):
+        """Test successful comment deletion."""
+        result = comments_mixin.delete_comment("TEST-123", "10001")
+
+        assert result["success"] is True
+        assert result["issue_key"] == "TEST-123"
+        assert result["comment_id"] == "10001"
+        comments_mixin.jira.delete.assert_called_once_with(
+            "rest/api/2/issue/TEST-123/comment/10001"
+        )
+
+    def test_delete_comment_missing_identifiers(self, comments_mixin):
+        """Test that missing identifiers are rejected."""
+        result = comments_mixin.delete_comment("", "10001")
+        assert result["success"] is False
+
+        result = comments_mixin.delete_comment("TEST-123", "")
+        assert result["success"] is False
+        comments_mixin.jira.delete.assert_not_called()
+
+    def test_delete_comment_api_error(self, comments_mixin):
+        """Test deletion failure on API error."""
+        comments_mixin.jira.delete.side_effect = Exception("boom")
+
+        result = comments_mixin.delete_comment("TEST-123", "10001")
+
+        assert result["success"] is False
+        assert "boom" in result["error"]

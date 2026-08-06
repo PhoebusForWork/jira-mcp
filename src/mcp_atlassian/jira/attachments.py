@@ -3,6 +3,7 @@
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,15 @@ from .protocols import AttachmentsOperationsProto
 
 # Configure logging
 logger = logging.getLogger("mcp-jira")
+
+# Wiki markup image references (e.g. "!photo_1.png|width=600!") that should
+# be preserved verbatim when a Markdown body is converted to wiki markup.
+# Restricted to filenames with image extensions so plain exclamation marks
+# in prose are never touched.
+WIKI_IMAGE_REF_PATTERN = re.compile(
+    r"!([^!\r\n|]+\.(?:png|jpe?g|gif|webp|svg))(\|[^!\r\n]*)?!",
+    re.IGNORECASE,
+)
 
 
 class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
@@ -881,6 +891,28 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             ),
         }
 
+    def _markdown_to_wiki_preserving_image_refs(self, body: str) -> str:
+        """Convert a Markdown body to wiki markup, keeping image refs intact.
+
+        Wiki image references (``!photo_1.png|width=600!``) inside the body
+        would otherwise be mangled by the Markdown converter (underscores
+        become emphasis, CJK filenames get escaped). Each reference is
+        swapped for an inert token before conversion and restored verbatim
+        afterwards, so any attachment filename can be referenced.
+        """
+        protected: dict[str, str] = {}
+
+        def _stash(match: re.Match[str]) -> str:
+            token = f"MCPWIKIIMGREF{len(protected)}Z"
+            protected[token] = match.group(0)
+            return token
+
+        protected_body = WIKI_IMAGE_REF_PATTERN.sub(_stash, body)
+        wiki_body = self.preprocessor.markdown_to_jira(protected_body)
+        for token, ref in protected.items():
+            wiki_body = wiki_body.replace(token, ref)
+        return wiki_body
+
     def add_comment_with_image(
         self,
         issue_key: str,
@@ -891,41 +923,67 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         width: int | None = None,
     ) -> dict[str, Any]:
         """
-        Upload an image and add a comment that displays it inline.
+        Add a comment that displays one or more images inline.
 
-        The image is attached to the issue, then a comment is posted through
-        REST API v2 with the body in wiki markup (Markdown input is converted)
-        followed by an image reference (``!filename!``), so the image renders
-        inside the comment on the Jira web UI.
+        The comment is posted through REST API v2 with the body in wiki
+        markup (Markdown input is converted), so wiki image references
+        render inline on the Jira web UI. Jira Cloud converts them into
+        internal ADF media nodes server-side.
+
+        Two ways to get images into the comment, combinable:
+
+        - Provide ``file_path`` or ``image_data``+``filename``: the file is
+          uploaded and its reference appended to the comment.
+        - Reference attachments that already exist on the issue directly in
+          ``body`` using wiki syntax (``!photo_1.png|width=600!``). These
+          references are preserved verbatim through the Markdown conversion,
+          so filenames with underscores or non-ASCII characters are safe.
 
         Args:
             issue_key: The Jira issue key (e.g., 'PROJ-123')
-            body: Comment text (Markdown), may be empty for an image-only comment
-            file_path: Local path of the image file to upload
+            body: Comment text (Markdown), may be empty when uploading an
+                image; may reference existing attachments with wiki syntax
+            file_path: Local path of the image file to upload (optional)
             image_data: Raw image bytes (alternative to file_path)
             filename: Filename for the attachment (required with image_data)
-            width: Optional rendered width in pixels
+            width: Optional rendered width in pixels for the uploaded image
 
         Returns:
-            A dictionary with the upload result, the wiki markup used and
-            the created comment details
+            A dictionary with the upload result (if any), the wiki markup
+            used and the created comment details
         """
-        upload_result = self._upload_image_for_embedding(
-            issue_key, file_path=file_path, image_data=image_data, filename=filename
-        )
-        if not upload_result.get("success"):
-            return upload_result
+        has_image = file_path is not None or image_data is not None
+        if not has_image and not body:
+            return {
+                "success": False,
+                "error": ("Provide a comment body, an image to upload, or both"),
+            }
 
-        attached_filename = upload_result["filename"]
-        markup = self._image_wiki_markup(attached_filename, width)
+        upload_result: dict[str, Any] | None = None
+        markup: str | None = None
+        if has_image:
+            upload_result = self._upload_image_for_embedding(
+                issue_key,
+                file_path=file_path,
+                image_data=image_data,
+                filename=filename,
+            )
+            if not upload_result.get("success"):
+                return upload_result
+            markup = self._image_wiki_markup(upload_result["filename"], width)
 
         try:
             wiki_body = ""
             if body:
                 # Convert Markdown to wiki markup (not ADF): the comment is
-                # posted via API v2 so the image reference stays intact
-                wiki_body = self.preprocessor.markdown_to_jira(body)
-            full_body = f"{wiki_body}\n\n{markup}" if wiki_body else markup
+                # posted via API v2 so image references stay intact
+                wiki_body = self._markdown_to_wiki_preserving_image_refs(body)
+            if markup and wiki_body:
+                full_body = f"{wiki_body}\n\n{markup}"
+            elif markup:
+                full_body = markup
+            else:
+                full_body = wiki_body
 
             result = self.jira.issue_add_comment(issue_key, full_body)
             if not isinstance(result, dict):
@@ -938,18 +996,36 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
         except HTTPError as e:
             error_msg = self._attachment_http_error_message(e, issue_key)
             logger.error(f"Error adding comment with image: {error_msg}")
+            prefix = (
+                "Image uploaded but adding the comment failed"
+                if upload_result
+                else "Adding the comment failed"
+            )
             return {
                 "success": False,
-                "error": f"Image uploaded but adding the comment failed: {error_msg}",
+                "error": f"{prefix}: {error_msg}",
                 "attachment": upload_result,
             }
         except Exception as e:
             logger.error(f"Error adding comment with image: {e}")
+            prefix = (
+                "Image uploaded but adding the comment failed"
+                if upload_result
+                else "Adding the comment failed"
+            )
             return {
                 "success": False,
-                "error": f"Image uploaded but adding the comment failed: {e}",
+                "error": f"{prefix}: {e}",
                 "attachment": upload_result,
             }
+
+        if upload_result:
+            message = (
+                f"Image '{upload_result['filename']}' uploaded and embedded "
+                f"in a new comment on {issue_key}"
+            )
+        else:
+            message = f"Comment added to {issue_key} with preserved image references"
 
         return {
             "success": True,
@@ -961,8 +1037,5 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
                 "created": result.get("created"),
                 "author": result.get("author", {}).get("displayName", "Unknown"),
             },
-            "message": (
-                f"Image '{attached_filename}' uploaded and embedded in a new "
-                f"comment on {issue_key}"
-            ),
+            "message": message,
         }

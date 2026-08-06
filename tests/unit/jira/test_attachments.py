@@ -1833,3 +1833,108 @@ class TestDeleteAttachment:
 
         assert result["success"] is False
         assert "boom" in result["error"]
+
+
+class TestCommentImageReferences:
+    """Tests for reference-only comments and image-ref preservation."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[])
+        attachments_mixin.preprocessor = MagicMock()
+        # Simulate the Markdown converter mangling underscores (emphasis)
+        attachments_mixin.preprocessor.markdown_to_jira.side_effect = lambda text: (
+            text.replace("_", "*")
+        )
+        return attachments_mixin
+
+    def test_comment_without_upload_references_existing(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test a comment that only references already-attached images."""
+        attachments_mixin.jira.issue_add_comment.return_value = {
+            "id": "3001",
+            "author": {"displayName": "Test User"},
+        }
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123",
+            "See attached:\n\n!existing_shot.png|width=900!",
+        )
+
+        assert result["success"] is True
+        assert result["attachment"] is None
+        assert result["image_markup"] is None
+        assert result["comment"]["id"] == "3001"
+        # No upload must have happened
+        attachments_mixin.jira.add_attachment.assert_not_called()
+        # The wiki image ref survives even though the converter mangles "_"
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        assert "!existing_shot.png|width=900!" in body_arg
+        # Non-image text was still converted
+        assert body_arg.startswith("See attached:")
+
+    def test_image_refs_preserved_with_cjk_and_underscores(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that CJK/underscore filenames pass through untouched."""
+        attachments_mixin.jira.issue_add_comment.return_value = {"id": "3002"}
+
+        body = (
+            "前後對照:\n"
+            "!01_存款頁空白.png|width=600!\n"
+            "!02_遊戲錢包為0_未找到錢包.PNG!\n"
+            "一般文字_底線會被轉換_這裡"
+        )
+        result = attachments_mixin.add_comment_with_image("TEST-123", body)
+
+        assert result["success"] is True
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        assert "!01_存款頁空白.png|width=600!" in body_arg
+        assert "!02_遊戲錢包為0_未找到錢包.PNG!" in body_arg
+        # Plain prose still went through the converter
+        assert "一般文字*底線會被轉換*這裡" in body_arg
+
+    def test_upload_and_reference_combined(self, attachments_mixin: AttachmentsMixin):
+        """Test combining an upload with existing-attachment references."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_add_comment.return_value = {"id": "3003"}
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123",
+            "Old: !old_image.png!",
+            image_data=b"png",
+            filename="new-image.png",
+        )
+
+        assert result["success"] is True
+        assert result["image_markup"] == "!new-image.png!"
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        assert "!old_image.png!" in body_arg
+        assert body_arg.endswith("!new-image.png!")
+
+    def test_no_body_and_no_image_rejected(self, attachments_mixin: AttachmentsMixin):
+        """Test that an empty call is rejected before any API call."""
+        result = attachments_mixin.add_comment_with_image("TEST-123", "")
+
+        assert result["success"] is False
+        assert "body" in result["error"].lower()
+        attachments_mixin.jira.issue_add_comment.assert_not_called()
+        attachments_mixin.jira.add_attachment.assert_not_called()
+
+    def test_prose_exclamations_not_protected(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that ordinary exclamation marks are left to the converter."""
+        attachments_mixin.jira.issue_add_comment.return_value = {"id": "3004"}
+
+        result = attachments_mixin.add_comment_with_image(
+            "TEST-123", "Great news! It_works! Done."
+        )
+
+        assert result["success"] is True
+        body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
+        # No image extension → not protected → converter ran on the text
+        assert body_arg == "Great news! It*works! Done."

@@ -3,6 +3,8 @@
 import logging
 from typing import Any
 
+from requests.exceptions import HTTPError
+
 from ..models.jira.adf import adf_to_text
 from ..utils import parse_date
 from .client import JiraClient
@@ -257,3 +259,48 @@ class CommentsMixin(JiraClient):
                 f"Error editing comment {comment_id} on issue {issue_key}: {str(e)}"
             )
             raise Exception(f"Error editing comment: {str(e)}") from e
+
+    def delete_comment(self, issue_key: str, comment_id: str) -> dict[str, Any]:
+        """
+        Delete a comment from an issue.
+
+        Args:
+            issue_key: The issue key (e.g. 'PROJ-123')
+            comment_id: The ID of the comment to delete
+
+        Returns:
+            A dictionary with the deletion result
+        """
+        if not issue_key or not comment_id:
+            return {
+                "success": False,
+                "error": "Both issue_key and comment_id are required",
+            }
+
+        try:
+            self.jira.delete(f"rest/api/2/issue/{issue_key}/comment/{comment_id}")
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 403:
+                error_msg = (
+                    f"Permission denied: you do not have permission to "
+                    f"delete comment {comment_id} on {issue_key} (HTTP 403)."
+                )
+            elif status == 404:
+                error_msg = f"Comment {comment_id} not found on {issue_key} (HTTP 404)."
+            else:
+                error_msg = str(e)
+            logger.error(f"Error deleting comment: {error_msg}")
+            return {"success": False, "error": error_msg}
+        except Exception as e:
+            logger.error(
+                f"Error deleting comment {comment_id} on issue {issue_key}: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "comment_id": comment_id,
+            "message": f"Comment {comment_id} deleted from {issue_key}",
+        }
