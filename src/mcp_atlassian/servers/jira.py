@@ -1556,6 +1556,138 @@ async def delete_comment(
 
 
 @jira_mcp.tool(
+    tags={"jira", "write", "toolset:jira_comments"},
+    annotations={"title": "Edit Comment with Image", "destructiveHint": True},
+)
+@check_write_access
+async def edit_comment_with_image(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    comment_id: Annotated[str, Field(description="The ID of the comment to replace")],
+    body: Annotated[
+        str,
+        Field(
+            description=(
+                "The COMPLETE new comment text in Markdown format — it "
+                "replaces the whole comment. Reference attachments already "
+                "on the issue with wiki syntax on their own line, e.g. "
+                "'!photo_1.png|width=600!' — these references are preserved "
+                "verbatim (underscores and non-ASCII filenames are safe)."
+            ),
+            default="",
+        ),
+    ] = "",
+    file_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Absolute path of a local image file to upload "
+                "and append to the new body. Mutually exclusive with "
+                "file_base64."
+            ),
+            default=None,
+        ),
+    ] = None,
+    file_base64: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Base64-encoded image content to upload. Requires "
+                "'filename'. Mutually exclusive with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    filename: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Filename for the attachment in Jira (e.g., 'screenshot.png'). "
+                "Required when using file_base64; ignored with file_path."
+            ),
+            default=None,
+        ),
+    ] = None,
+    width: Annotated[
+        int | None,
+        Field(
+            description=(
+                "(Optional) Rendered width in pixels for the uploaded image "
+                "(e.g., 600)."
+            ),
+            default=None,
+            gt=0,
+        ),
+    ] = None,
+) -> str:
+    """Replace an existing comment in place, keeping inline images working.
+
+    Use this instead of 'jira_edit_comment' whenever the comment contains
+    (or should contain) images: the plain edit tool escapes image syntax,
+    while this tool updates via wiki markup so image references render
+    inline after the edit. No delete-and-repost needed.
+
+    The body REPLACES the entire comment, so pass the complete new text.
+    Reference existing attachments with wiki syntax in the body, and/or
+    upload one new image via file_path/file_base64 (its reference is
+    appended; same-name attachments are renamed with a timestamp).
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        comment_id: The ID of the comment to replace.
+        body: Complete new comment text in Markdown; may reference existing
+            attachments with wiki image syntax.
+        file_path: (Optional) Local image path to upload.
+        file_base64: (Optional) Base64-encoded image content to upload.
+        filename: Attachment filename, required with file_base64.
+        width: Optional rendered width in pixels for the uploaded image.
+
+    Returns:
+        JSON string with the upload result (if any), the wiki markup used
+        and the updated comment details.
+
+    Raises:
+        ValueError: If in read-only mode, input is invalid, the comment
+            does not exist, or the upload or update fails.
+    """
+    jira = await get_jira_fetcher(ctx)
+
+    path: str | None = None
+    data: bytes | None = None
+    name: str | None = None
+    if file_path is not None or file_base64 is not None:
+        path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
+    elif not body:
+        raise ValueError(
+            "Provide 'body', an image (file_path or file_base64), or both."
+        )
+
+    result = jira.edit_comment_with_image(
+        issue_key=issue_key,
+        comment_id=comment_id,
+        body=body,
+        file_path=path,
+        image_data=data,
+        filename=name,
+        width=width,
+    )
+
+    if not result.get("success"):
+        raise ValueError(
+            f"Failed to edit comment {comment_id} on {issue_key}: "
+            f"{result.get('error', 'unknown error')}"
+        )
+    return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+@jira_mcp.tool(
     tags={"jira", "read", "toolset:jira_agile"},
     annotations={"title": "Get Agile Boards", "readOnlyHint": True},
 )
@@ -2282,6 +2414,9 @@ async def add_comment(
 ) -> str:
     """Add a comment to a Jira issue.
 
+    Text-only comments. Image syntax in the body will NOT render — to show
+    images inline in a comment, use 'jira_add_comment_with_image' instead.
+
     Args:
         ctx: The FastMCP context.
         issue_key: Jira issue key.
@@ -2326,6 +2461,10 @@ async def edit_comment(
     ] = None,
 ) -> str:
     """Edit an existing comment on a Jira issue.
+
+    Text-only edits. Image syntax in the body will NOT render (it gets
+    escaped) — to edit a comment that contains or should contain inline
+    images, use 'jira_edit_comment_with_image' instead.
 
     Args:
         ctx: The FastMCP context.

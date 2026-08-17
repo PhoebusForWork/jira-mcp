@@ -395,6 +395,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         delete_issue,
         download_attachments,
         edit_comment,
+        edit_comment_with_image,
         embed_image_in_description,
         get_agile_boards,
         get_all_projects,
@@ -467,6 +468,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(delete_comment)
     jira_sub_mcp.add_tool(embed_image_in_description)
     jira_sub_mcp.add_tool(add_comment_with_image)
+    jira_sub_mcp.add_tool(edit_comment_with_image)
     test_mcp.mount(jira_sub_mcp, prefix="jira")
     return test_mcp
 
@@ -2827,4 +2829,63 @@ async def test_delete_comment_failure_raises(jira_client, mock_jira_fetcher):
         await jira_client.call_tool(
             "jira_delete_comment",
             {"issue_key": "TEST-123", "comment_id": "999"},
+        )
+
+
+@pytest.mark.anyio
+async def test_edit_comment_with_image_tool(jira_client, mock_jira_fetcher):
+    """Test replacing a comment in place with preserved image refs."""
+    mock_jira_fetcher.edit_comment_with_image.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": None,
+        "image_markup": None,
+        "comment": {"id": "10001", "author": "Test User"},
+        "message": "Comment 10001 on TEST-123 replaced in place",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_edit_comment_with_image",
+        {
+            "issue_key": "TEST-123",
+            "comment_id": "10001",
+            "body": "Fixed:\n\n!existing_shot.png|width=900!",
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    mock_jira_fetcher.edit_comment_with_image.assert_called_once_with(
+        issue_key="TEST-123",
+        comment_id="10001",
+        body="Fixed:\n\n!existing_shot.png|width=900!",
+        file_path=None,
+        image_data=None,
+        filename=None,
+        width=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_edit_comment_with_image_requires_body_or_image(jira_client):
+    """Test that an empty edit call is rejected."""
+    with pytest.raises(ToolError, match="body"):
+        await jira_client.call_tool(
+            "jira_edit_comment_with_image",
+            {"issue_key": "TEST-123", "comment_id": "10001"},
+        )
+
+
+@pytest.mark.anyio
+async def test_edit_comment_with_image_failure_raises(jira_client, mock_jira_fetcher):
+    """Test that a failed in-place edit surfaces as a tool error."""
+    mock_jira_fetcher.edit_comment_with_image.return_value = {
+        "success": False,
+        "error": "Comment 999 not found on TEST-123 (HTTP 404).",
+    }
+
+    with pytest.raises(ToolError, match="not found"):
+        await jira_client.call_tool(
+            "jira_edit_comment_with_image",
+            {"issue_key": "TEST-123", "comment_id": "999", "body": "x"},
         )

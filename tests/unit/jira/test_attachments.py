@@ -1938,3 +1938,92 @@ class TestCommentImageReferences:
         body_arg = attachments_mixin.jira.issue_add_comment.call_args.args[1]
         # No image extension → not protected → converter ran on the text
         assert body_arg == "Great news! It*works! Done."
+
+
+class TestEditCommentWithImage:
+    """Tests for in-place comment edits with inline images."""
+
+    @pytest.fixture
+    def attachments_mixin(self, jira_fetcher: JiraFetcher) -> AttachmentsMixin:
+        attachments_mixin = jira_fetcher
+        attachments_mixin.jira = MagicMock()
+        attachments_mixin.get_issue_attachments = MagicMock(return_value=[])
+        attachments_mixin.preprocessor = MagicMock()
+        # Simulate the Markdown converter mangling underscores (emphasis)
+        attachments_mixin.preprocessor.markdown_to_jira.side_effect = lambda text: (
+            text.replace("_", "*")
+        )
+        return attachments_mixin
+
+    def test_edit_preserves_existing_image_refs(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test replacing a comment body while keeping image refs intact."""
+        attachments_mixin.jira.issue_edit_comment.return_value = {
+            "id": "10001",
+            "updated": "2026-01-02T00:00:00.000+0000",
+            "author": {"displayName": "Test User"},
+        }
+
+        result = attachments_mixin.edit_comment_with_image(
+            "TEST-123",
+            "10001",
+            "Fixed version:\n\n!existing_shot.png|width=900!",
+        )
+
+        assert result["success"] is True
+        assert result["attachment"] is None
+        assert result["comment"]["id"] == "10001"
+        attachments_mixin.jira.add_attachment.assert_not_called()
+        call_args = attachments_mixin.jira.issue_edit_comment.call_args.args
+        assert call_args[0] == "TEST-123"
+        assert call_args[1] == "10001"
+        assert "!existing_shot.png|width=900!" in call_args[2]
+        assert call_args[2].startswith("Fixed version:")
+
+    def test_edit_with_new_upload(self, attachments_mixin: AttachmentsMixin):
+        """Test replacing a comment and uploading a new image in one call."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_edit_comment.return_value = {"id": "10002"}
+
+        result = attachments_mixin.edit_comment_with_image(
+            "TEST-123",
+            "10002",
+            "Updated text",
+            image_data=b"png",
+            filename="fix.png",
+            width=500,
+        )
+
+        assert result["success"] is True
+        assert result["image_markup"] == "!fix.png|width=500!"
+        body_arg = attachments_mixin.jira.issue_edit_comment.call_args.args[2]
+        assert body_arg.endswith("!fix.png|width=500!")
+
+    def test_edit_requires_comment_id(self, attachments_mixin: AttachmentsMixin):
+        """Test that a missing comment_id is rejected."""
+        result = attachments_mixin.edit_comment_with_image("TEST-123", "", "New body")
+        assert result["success"] is False
+        assert "comment_id" in result["error"]
+        attachments_mixin.jira.issue_edit_comment.assert_not_called()
+
+    def test_edit_requires_body_or_image(self, attachments_mixin: AttachmentsMixin):
+        """Test that an empty edit is rejected."""
+        result = attachments_mixin.edit_comment_with_image("TEST-123", "10001", "")
+        assert result["success"] is False
+        attachments_mixin.jira.issue_edit_comment.assert_not_called()
+
+    def test_edit_api_error_keeps_attachment_info(
+        self, attachments_mixin: AttachmentsMixin
+    ):
+        """Test that a failed edit still reports a completed upload."""
+        attachments_mixin.jira.add_attachment.return_value = [{"id": "1"}]
+        attachments_mixin.jira.issue_edit_comment.side_effect = Exception("edit failed")
+
+        result = attachments_mixin.edit_comment_with_image(
+            "TEST-123", "10001", "text", image_data=b"png", filename="fix.png"
+        )
+
+        assert result["success"] is False
+        assert "edit failed" in result["error"]
+        assert result["attachment"]["success"] is True

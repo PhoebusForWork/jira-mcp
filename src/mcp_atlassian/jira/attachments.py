@@ -1039,3 +1039,134 @@ class AttachmentsMixin(JiraClient, AttachmentsOperationsProto):
             },
             "message": message,
         }
+
+    def edit_comment_with_image(
+        self,
+        issue_key: str,
+        comment_id: str,
+        body: str,
+        file_path: str | None = None,
+        image_data: bytes | None = None,
+        filename: str | None = None,
+        width: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Replace a comment's body in place, with inline images preserved.
+
+        The comment is updated through REST API v2 (``issue_edit_comment``)
+        with the body in wiki markup, so wiki image references render inline
+        after the edit — unlike the plain edit path, which converts to ADF
+        and escapes image syntax. ``body`` REPLACES the entire comment, so
+        it must be the complete new text.
+
+        Images can come from two sources, combinable:
+
+        - Reference attachments already on the issue in ``body`` with wiki
+          syntax (``!photo_1.png|width=600!``); references are preserved
+          verbatim through the Markdown conversion.
+        - Provide ``file_path`` or ``image_data``+``filename`` to upload a
+          new file and append its reference to the new body.
+
+        Args:
+            issue_key: The Jira issue key (e.g., 'PROJ-123')
+            comment_id: The ID of the comment to replace
+            body: The complete new comment text (Markdown); may reference
+                existing attachments with wiki syntax
+            file_path: Local path of an image file to upload (optional)
+            image_data: Raw image bytes (alternative to file_path)
+            filename: Filename for the attachment (required with image_data)
+            width: Optional rendered width in pixels for the uploaded image
+
+        Returns:
+            A dictionary with the upload result (if any), the wiki markup
+            used and the updated comment details
+        """
+        if not comment_id:
+            return {"success": False, "error": "No comment_id provided"}
+
+        has_image = file_path is not None or image_data is not None
+        if not has_image and not body:
+            return {
+                "success": False,
+                "error": "Provide a comment body, an image to upload, or both",
+            }
+
+        upload_result: dict[str, Any] | None = None
+        markup: str | None = None
+        if has_image:
+            upload_result = self._upload_image_for_embedding(
+                issue_key,
+                file_path=file_path,
+                image_data=image_data,
+                filename=filename,
+            )
+            if not upload_result.get("success"):
+                return upload_result
+            markup = self._image_wiki_markup(upload_result["filename"], width)
+
+        try:
+            wiki_body = ""
+            if body:
+                # Convert Markdown to wiki markup (not ADF): the comment is
+                # updated via API v2 so image references stay intact
+                wiki_body = self._markdown_to_wiki_preserving_image_refs(body)
+            if markup and wiki_body:
+                full_body = f"{wiki_body}\n\n{markup}"
+            elif markup:
+                full_body = markup
+            else:
+                full_body = wiki_body
+
+            result = self.jira.issue_edit_comment(issue_key, comment_id, full_body)
+            if not isinstance(result, dict):
+                msg = (
+                    "Unexpected return value type from "
+                    f"`jira.issue_edit_comment`: {type(result)}"
+                )
+                logger.error(msg)
+                raise TypeError(msg)
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                error_msg = f"Comment {comment_id} not found on {issue_key} (HTTP 404)."
+            else:
+                error_msg = self._attachment_http_error_message(e, issue_key)
+            logger.error(f"Error editing comment with image: {error_msg}")
+            prefix = (
+                "Image uploaded but editing the comment failed"
+                if upload_result
+                else "Editing the comment failed"
+            )
+            return {
+                "success": False,
+                "error": f"{prefix}: {error_msg}",
+                "attachment": upload_result,
+            }
+        except Exception as e:
+            logger.error(f"Error editing comment with image: {e}")
+            prefix = (
+                "Image uploaded but editing the comment failed"
+                if upload_result
+                else "Editing the comment failed"
+            )
+            return {
+                "success": False,
+                "error": f"{prefix}: {e}",
+                "attachment": upload_result,
+            }
+
+        return {
+            "success": True,
+            "issue_key": issue_key,
+            "attachment": upload_result,
+            "image_markup": markup,
+            "comment": {
+                "id": result.get("id"),
+                "updated": result.get("updated"),
+                "author": result.get("author", {}).get("displayName", "Unknown"),
+            },
+            "message": (
+                f"Comment {comment_id} on {issue_key} replaced in place "
+                "with inline image references preserved"
+            ),
+        }
