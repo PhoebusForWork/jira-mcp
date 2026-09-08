@@ -171,6 +171,136 @@ class TestIssuesMixin:
 
         issues_mixin.jira.issue_get_comments.assert_not_called()
 
+    def test_get_issue_includes_comments_with_narrowed_fields(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Comments are governed by comment_limit, not by the `fields` selection.
+
+        Regression test: narrowing `fields` used to silently drop comments
+        because the comment field was only auto-added for the default selection.
+        """
+        comments_data = {
+            "comments": [
+                {
+                    "id": "1",
+                    "body": "Narrowed-fields comment",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                }
+            ]
+        }
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {"summary": "Test Issue", "status": {"name": "Open"}},
+        }
+        issues_mixin.jira.issue_get_comments.return_value = comments_data
+
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields="summary,status", comment_limit=10
+        )
+
+        # The comment field is requested from the API despite the narrow selection
+        assert "comment" in issues_mixin.jira.get_issue.call_args[1]["fields"]
+        issues_mixin.jira.issue_get_comments.assert_called_once_with("TEST-123")
+
+        # And the comments survive into the simplified output
+        assert len(issue.comments) == 1
+        assert issue.comments[0].body == "Narrowed-fields comment"
+        simplified = issue.to_simplified_dict()
+        assert len(simplified["comments"]) == 1
+        assert simplified["comments"][0]["body"] == "Narrowed-fields comment"
+
+    def test_get_issue_returns_comments_when_api_omits_comment_field(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Comments are still returned if the API response has no comment field."""
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {"summary": "Test Issue"},
+        }
+        issues_mixin.jira.issue_get_comments.return_value = {
+            "comments": [
+                {
+                    "id": "1",
+                    "body": "Recovered comment",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                }
+            ]
+        }
+
+        issue = issues_mixin.get_issue("TEST-123", comment_limit=10)
+
+        assert len(issue.comments) == 1
+        assert issue.comments[0].body == "Recovered comment"
+
+    def test_get_issue_all_fields_passed_through_unchanged(
+        self, issues_mixin: IssuesMixin, make_issue_data
+    ):
+        """'*all' must reach the API verbatim rather than being rewritten.
+
+        Regression test: '*all' used to be replaced by the default field list,
+        silently dropping every custom field the caller asked for.
+        """
+        issues_mixin.jira.get_issue.return_value = make_issue_data(
+            issue_id="10001", summary="Test issue"
+        )
+        issues_mixin.jira.issue_get_comments.return_value = {"comments": []}
+
+        issues_mixin.get_issue("TEST-123", fields="*all", comment_limit=10)
+
+        assert issues_mixin.jira.get_issue.call_args[1]["fields"] == "*all"
+
+    def test_get_issue_comment_limit_truncates_with_narrowed_fields(
+        self, issues_mixin: IssuesMixin
+    ):
+        """comment_limit truncates the comment list for a narrow field selection."""
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {"summary": "Test Issue"},
+        }
+        issues_mixin.jira.issue_get_comments.return_value = {
+            "comments": [
+                {
+                    "id": str(index),
+                    "body": f"Comment {index}",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                }
+                for index in range(5)
+            ]
+        }
+
+        issue = issues_mixin.get_issue("TEST-123", fields="summary", comment_limit=2)
+
+        assert len(issue.comments) == 2
+        assert [comment.body for comment in issue.comments] == [
+            "Comment 0",
+            "Comment 1",
+        ]
+
+    def test_get_issue_no_comments_when_limit_zero_with_narrowed_fields(
+        self, issues_mixin: IssuesMixin
+    ):
+        """comment_limit=0 suppresses the extra comment request entirely."""
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {"summary": "Test Issue"},
+        }
+
+        issue = issues_mixin.get_issue("TEST-123", fields="summary", comment_limit=0)
+
+        assert "comment" not in issues_mixin.jira.get_issue.call_args[1]["fields"]
+        issues_mixin.jira.issue_get_comments.assert_not_called()
+        assert issue.comments == []
+
     def test_get_issue_with_epic_info(self, issues_mixin: IssuesMixin, make_issue_data):
         """Test retrieving issue with epic information."""
         try:
@@ -926,8 +1056,11 @@ class TestIssuesMixin:
             customfield_10050={"value": "Option value"},
         )
 
-        # Test with string format
-        issue = issues_mixin.get_issue("TEST-123", fields="summary,customfield_10049")
+        # comment_limit=0 keeps the assertions focused on field selection alone
+        # (a positive comment_limit legitimately appends the comment field).
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields="summary,customfield_10049", comment_limit=0
+        )
 
         # Verify the API call
         issues_mixin.jira.get_issue.assert_called_with(
@@ -947,7 +1080,7 @@ class TestIssuesMixin:
         # Test with list format
         issues_mixin.jira.get_issue.reset_mock()
         issue = issues_mixin.get_issue(
-            "TEST-123", fields=["summary", "customfield_10050"]
+            "TEST-123", fields=["summary", "customfield_10050"], comment_limit=0
         )
 
         # Verify API call converts list to comma-separated string
