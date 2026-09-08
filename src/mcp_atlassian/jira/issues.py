@@ -96,55 +96,50 @@ class IssuesMixin(
             elif isinstance(fields_param, list | tuple | set):
                 fields_param = ",".join(fields_param)
 
-            # Compare as sets to avoid hash randomization issues across processes
-            fields_set = (
-                set(fields_param.split(",")) if fields_param != "*all" else None
-            )
-            if fields_param == "*all" or fields_set == DEFAULT_READ_JIRA_FIELDS:
-                # Default fields are being used - preserve the order
-                default_fields_list = (
-                    fields_param.split(",")
-                    if fields_param != "*all"
-                    else list(DEFAULT_READ_JIRA_FIELDS)
-                )
-                additional_fields = []
+            comment_limit_int = self._normalize_comment_limit(comment_limit)
+            wants_comments = comment_limit_int is None or comment_limit_int > 0
+
+            # Augment the requested fields with everything implied by the other
+            # parameters. This applies to any explicit field selection, not just
+            # the default one, so that `comment_limit` keeps working when the
+            # caller narrows `fields`. "*all" already covers every field and is
+            # therefore passed through untouched.
+            if fields_param != "*all":
+                requested_field_list = [
+                    field.strip() for field in fields_param.split(",") if field.strip()
+                ]
+                already_requested = set(requested_field_list)
+                additional_fields: list[str] = []
 
                 # Add appropriate fields based on expand parameter
                 if expand:
                     expand_params = expand.split(",")
                     if (
                         "changelog" in expand_params
-                        and "changelog" not in default_fields_list
-                        and "changelog" not in additional_fields
+                        and "changelog" not in already_requested
                     ):
                         additional_fields.append("changelog")
+                        already_requested.add("changelog")
                     if (
                         "renderedFields" in expand_params
-                        and "rendered" not in default_fields_list
-                        and "rendered" not in additional_fields
+                        and "rendered" not in already_requested
                     ):
                         additional_fields.append("rendered")
+                        already_requested.add("rendered")
 
                 # Add appropriate fields based on properties parameter
-                if (
-                    properties
-                    and "properties" not in default_fields_list
-                    and "properties" not in additional_fields
-                ):
+                if properties and "properties" not in already_requested:
                     additional_fields.append("properties")
+                    already_requested.add("properties")
 
-                comment_limit_int = self._normalize_comment_limit(comment_limit)
-                if (
-                    (comment_limit_int is None or comment_limit_int > 0)
-                    and "comment" not in default_fields_list
-                    and "comment" not in additional_fields
-                ):
+                # Comments are governed by comment_limit rather than by `fields`.
+                if wants_comments and "comment" not in already_requested:
                     additional_fields.append("comment")
+                    already_requested.add("comment")
 
-                # Combine default fields with additional fields, preserving order
+                # Combine requested fields with additional fields, preserving order
                 if additional_fields:
-                    fields_param = ",".join(default_fields_list + additional_fields)
-            # Handle non-default fields string
+                    fields_param = ",".join(requested_field_list + additional_fields)
 
             # Build expand parameter if provided
             expand_param = expand
@@ -189,14 +184,19 @@ class IssuesMixin(
                 if isinstance(raw_description, str) and raw_description:
                     fields_data["description"] = self._clean_text(raw_description)
 
-            # Get comments if needed
-            if "comment" in fields_data:
-                comment_limit_int = self._normalize_comment_limit(comment_limit)
+            # Get comments if needed. This is driven by comment_limit rather than
+            # by the shape of the response, so that comments are still returned
+            # when the API omits the comment field from a narrowed selection.
+            if wants_comments:
                 comments = self._get_issue_comments_if_needed(
                     issue_key, comment_limit_int
                 )
                 # Add comments to the issue data for processing by the model
-                fields_data["comment"]["comments"] = comments
+                comment_container = fields_data.get("comment")
+                if not isinstance(comment_container, dict):
+                    comment_container = {}
+                    fields_data["comment"] = comment_container
+                comment_container["comments"] = comments
 
             # Clean comment bodies (convert Jira wiki markup/HTML to Markdown)
             # Must happen AFTER _get_issue_comments_if_needed which may replace comments
