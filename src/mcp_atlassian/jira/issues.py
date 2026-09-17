@@ -197,6 +197,13 @@ class IssuesMixin(
                     comment_container = {}
                     fields_data["comment"] = comment_container
                 comment_container["comments"] = comments
+            else:
+                # comment_limit=0 means no comments at all. "*all" and an
+                # explicit "comment" field both make the API inline them, so
+                # anything it returned has to be dropped here.
+                comment_container = fields_data.get("comment")
+                if isinstance(comment_container, dict):
+                    comment_container["comments"] = []
 
             # Clean comment bodies (convert Jira wiki markup/HTML to Markdown)
             # Must happen AFTER _get_issue_comments_if_needed which may replace comments
