@@ -1055,6 +1055,13 @@ def _resolve_attachment_source(
         ValueError: If the combination of inputs is invalid or the base64
             payload cannot be decoded or exceeds the size limit.
     """
+    # Some MCP clients cannot send JSON null for string-typed optional params
+    # (their schema validator rejects undefined), so they send "" instead.
+    # Treat empty/whitespace-only values as omitted before the checks below.
+    file_path = (file_path or "").strip() or None
+    file_base64 = (file_base64 or "").strip() or None
+    filename = (filename or "").strip() or None
+
     if (file_path is None) == (file_base64 is None):
         raise ValueError(
             "Provide exactly one of 'file_path' or 'file_base64' (with 'filename')."
@@ -1487,7 +1494,9 @@ async def add_comment_with_image(
     path: str | None = None
     data: bytes | None = None
     name: str | None = None
-    if file_path is not None or file_base64 is not None:
+    # Empty strings arrive from clients that cannot send JSON null; treat as omitted
+    # so the body-only mode (reference existing attachments) still works.
+    if (file_path or "").strip() or (file_base64 or "").strip():
         path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
     elif not body:
         raise ValueError(
@@ -1662,7 +1671,9 @@ async def edit_comment_with_image(
     path: str | None = None
     data: bytes | None = None
     name: str | None = None
-    if file_path is not None or file_base64 is not None:
+    # Empty strings arrive from clients that cannot send JSON null; treat as omitted
+    # so the body-only mode (reference existing attachments) still works.
+    if (file_path or "").strip() or (file_base64 or "").strip():
         path, data, name = _resolve_attachment_source(file_path, file_base64, filename)
     elif not body:
         raise ValueError(
