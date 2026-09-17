@@ -1,5 +1,6 @@
 """Unit tests for the Jira FastMCP server implementation."""
 
+import base64
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -15,6 +16,7 @@ from starlette.requests import Request
 from src.mcp_atlassian.jira import JiraFetcher
 from src.mcp_atlassian.jira.config import JiraConfig
 from src.mcp_atlassian.servers.context import MainAppContext
+from src.mcp_atlassian.servers.jira import _resolve_attachment_source
 from src.mcp_atlassian.servers.main import AtlassianMCP
 from src.mcp_atlassian.utils.oauth import OAuthConfig
 from tests.fixtures.jira_mocks import (
@@ -2888,4 +2890,161 @@ async def test_edit_comment_with_image_failure_raises(jira_client, mock_jira_fet
         await jira_client.call_tool(
             "jira_edit_comment_with_image",
             {"issue_key": "TEST-123", "comment_id": "999", "body": "x"},
+        )
+
+
+class TestResolveAttachmentSourceEmptyStrings:
+    """Empty-string attachment params are treated as omitted.
+
+    Some MCP clients cannot emit JSON null for string-typed optional
+    parameters and send an empty string instead. Regression tests: these
+    used to be taken as "a value was supplied" and rejected.
+    """
+
+    def test_empty_file_path_is_not_treated_as_supplied(self):
+        """An empty file_path alongside file_base64 selects base64 mode."""
+        encoded = base64.b64encode(b"png bytes").decode("ascii")
+
+        path, data, name = _resolve_attachment_source("", encoded, "shot.png")
+
+        assert path is None
+        assert data == b"png bytes"
+        assert name == "shot.png"
+
+    def test_whitespace_file_base64_is_not_treated_as_supplied(self):
+        """A whitespace-only file_base64 alongside file_path selects path mode."""
+        path, data, name = _resolve_attachment_source("/tmp/shot.png", "   ", "")
+
+        assert path == "/tmp/shot.png"
+        assert data is None
+        assert name is None
+
+    def test_both_empty_is_still_rejected(self):
+        """Empty strings for both sources are omissions, not a valid selection."""
+        with pytest.raises(ValueError, match="exactly one"):
+            _resolve_attachment_source("", "", "")
+
+    def test_both_supplied_is_still_rejected(self):
+        """The mutual-exclusion check still applies to real values."""
+        encoded = base64.b64encode(b"png bytes").decode("ascii")
+
+        with pytest.raises(ValueError, match="exactly one"):
+            _resolve_attachment_source("/tmp/shot.png", encoded, "shot.png")
+
+    def test_whitespace_filename_with_base64_is_rejected(self):
+        """A whitespace-only filename counts as missing, not as a name."""
+        encoded = base64.b64encode(b"png bytes").decode("ascii")
+
+        with pytest.raises(ValueError, match="'filename' is required"):
+            _resolve_attachment_source(None, encoded, "   ")
+
+
+@pytest.mark.anyio
+async def test_add_comment_with_image_accepts_empty_string_params(
+    jira_client, mock_jira_fetcher
+):
+    """Body-only mode works when a client sends "" instead of null.
+
+    Regression test: the empty strings used to be read as "an image was
+    supplied", so the call failed instead of referencing existing attachments.
+    """
+    mock_jira_fetcher.add_comment_with_image.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": None,
+        "image_markup": None,
+        "comment": {"id": "2002", "author": "Test User"},
+        "message": "Comment added",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_add_comment_with_image",
+        {
+            "issue_key": "TEST-123",
+            "body": "See !existing_shot.png|width=600!",
+            "file_path": "",
+            "file_base64": "",
+            "filename": "",
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    mock_jira_fetcher.add_comment_with_image.assert_called_once_with(
+        issue_key="TEST-123",
+        body="See !existing_shot.png|width=600!",
+        file_path=None,
+        image_data=None,
+        filename=None,
+        width=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_add_comment_with_image_empty_strings_without_body_rejected(jira_client):
+    """Empty strings plus an empty body leave nothing to post."""
+    with pytest.raises(ToolError, match="body"):
+        await jira_client.call_tool(
+            "jira_add_comment_with_image",
+            {
+                "issue_key": "TEST-123",
+                "body": "",
+                "file_path": "",
+                "file_base64": "",
+            },
+        )
+
+
+@pytest.mark.anyio
+async def test_edit_comment_with_image_accepts_empty_string_params(
+    jira_client, mock_jira_fetcher
+):
+    """In-place edit works when a client sends "" instead of null."""
+    mock_jira_fetcher.edit_comment_with_image.return_value = {
+        "success": True,
+        "issue_key": "TEST-123",
+        "attachment": None,
+        "image_markup": None,
+        "comment": {"id": "10001", "author": "Test User"},
+        "message": "Comment 10001 on TEST-123 replaced in place",
+    }
+
+    response = await jira_client.call_tool(
+        "jira_edit_comment_with_image",
+        {
+            "issue_key": "TEST-123",
+            "comment_id": "10001",
+            "body": "Fixed:\n\n!existing_shot.png|width=900!",
+            "file_path": "",
+            "file_base64": "",
+            "filename": "",
+        },
+    )
+
+    content = json.loads(response.content[0].text)
+    assert content["success"] is True
+    mock_jira_fetcher.edit_comment_with_image.assert_called_once_with(
+        issue_key="TEST-123",
+        comment_id="10001",
+        body="Fixed:\n\n!existing_shot.png|width=900!",
+        file_path=None,
+        image_data=None,
+        filename=None,
+        width=None,
+    )
+
+
+@pytest.mark.anyio
+async def test_edit_comment_with_image_empty_strings_without_body_rejected(jira_client):
+    """Empty strings plus an empty body leave nothing to replace the comment with."""
+    with pytest.raises(ToolError, match="body"):
+        await jira_client.call_tool(
+            "jira_edit_comment_with_image",
+            {
+                "issue_key": "TEST-123",
+                "comment_id": "10001",
+                "body": "",
+                "file_path": "",
+                "file_base64": "",
+            },
         )
