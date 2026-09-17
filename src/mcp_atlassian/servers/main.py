@@ -360,8 +360,11 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         return app
 
 
+# The third parameter is the timer's return type. types-cachetools declares it
+# with a PEP 696 default of float, which mypy only honours from 1.12 onwards, so
+# it is spelled out here to keep older type checkers working.
 token_validation_cache: TTLCache[
-    int, tuple[bool, str | None, JiraFetcher | None, ConfluenceFetcher | None]
+    int, tuple[bool, str | None, JiraFetcher | None, ConfluenceFetcher | None], float
 ] = TTLCache(maxsize=100, ttl=300)
 
 
