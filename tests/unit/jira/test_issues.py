@@ -301,6 +301,102 @@ class TestIssuesMixin:
         issues_mixin.jira.issue_get_comments.assert_not_called()
         assert issue.comments == []
 
+    def test_get_issue_comment_limit_zero_drops_inlined_comments(
+        self, issues_mixin: IssuesMixin
+    ):
+        """comment_limit=0 wins over comments the API inlined on its own.
+
+        Regression test: "*all" and an explicit "comment" field both make the
+        API return comments inline. Skipping the extra fetch was not enough —
+        whatever came back inline leaked into the result.
+        """
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "comment": {
+                    "comments": [
+                        {
+                            "id": "1",
+                            "body": "Inlined by the API",
+                            "author": {"displayName": "Jane Doe"},
+                            "created": "2023-01-02T00:00:00.000+0000",
+                            "updated": "2023-01-02T00:00:00.000+0000",
+                        }
+                    ]
+                },
+            },
+        }
+
+        issue = issues_mixin.get_issue("TEST-123", fields="*all", comment_limit=0)
+
+        issues_mixin.jira.issue_get_comments.assert_not_called()
+        assert issue.comments == []
+        assert "comments" not in issue.to_simplified_dict()
+
+    def test_get_issue_comment_limit_zero_with_explicit_comment_field(
+        self, issues_mixin: IssuesMixin
+    ):
+        """Asking for the comment field does not override comment_limit=0."""
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "comment": {
+                    "comments": [
+                        {
+                            "id": "1",
+                            "body": "Inlined by the API",
+                            "author": {"displayName": "Jane Doe"},
+                            "created": "2023-01-02T00:00:00.000+0000",
+                            "updated": "2023-01-02T00:00:00.000+0000",
+                        }
+                    ]
+                },
+            },
+        }
+
+        issue = issues_mixin.get_issue(
+            "TEST-123", fields="summary,comment", comment_limit=0
+        )
+
+        issues_mixin.jira.issue_get_comments.assert_not_called()
+        assert issue.comments == []
+
+    def test_get_issue_positive_limit_truncates_inlined_comments(
+        self, issues_mixin: IssuesMixin
+    ):
+        """A positive comment_limit still truncates, and must keep doing so."""
+        issues_mixin.jira.get_issue.return_value = {
+            "id": "12345",
+            "key": "TEST-123",
+            "fields": {
+                "summary": "Test Issue",
+                "comment": {"comments": [{"id": "x", "body": "stale inline"}]},
+            },
+        }
+        issues_mixin.jira.issue_get_comments.return_value = {
+            "comments": [
+                {
+                    "id": str(index),
+                    "body": f"Comment {index}",
+                    "author": {"displayName": "Jane Doe"},
+                    "created": "2023-01-02T00:00:00.000+0000",
+                    "updated": "2023-01-02T00:00:00.000+0000",
+                }
+                for index in range(5)
+            ]
+        }
+
+        issue = issues_mixin.get_issue("TEST-123", fields="*all", comment_limit=2)
+
+        assert [comment.body for comment in issue.comments] == [
+            "Comment 0",
+            "Comment 1",
+        ]
+
     def test_get_issue_with_epic_info(self, issues_mixin: IssuesMixin, make_issue_data):
         """Test retrieving issue with epic information."""
         try:
